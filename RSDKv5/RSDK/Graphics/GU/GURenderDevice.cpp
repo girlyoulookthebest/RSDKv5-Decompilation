@@ -30,12 +30,12 @@ using namespace RSDK;
 
 static float *screen_vertex = (float *)0x441FC100;
 static u32 *ge_cmd = (u32 *)0x441FC000;
-static u16 *psp_gu_vram_base = (u16 *)(0x44000000);
+static u16 *psp_gu_vram_base = (u16 *)(0x44000000);//0x600000
 static u32 *ge_cmd_ptr = (u32 *)0x441FC000;
 static u32 gecbid;
 static u32 video_direct = 0;
 
-static u32 __attribute__((aligned(16))) display_list[32];
+static u32 __attribute__((aligned(16))) display_list[128];
 static u16 *screen_texture = (u16 *)(0x4000000 + (512 * 272 * 2));
 static u16 *current_screen_texture = (u16 *)(0x4000000 + (512 * 272 * 2));
 static u16 *screen_pixels = (u16 *)(0x4000000 + (512 * 272 * 2));
@@ -196,14 +196,14 @@ void RGBtoBGR()
 void RenderDevice::FlipScreen()
 {
     //RGBtoBGR();
-    u32 *old_ge_cmd_ptr = ge_cmd_ptr;
+    //u32 *old_ge_cmd_ptr = ge_cmd_ptr;
     sceKernelDcacheWritebackAll();
     // Render the current screen
-    ge_cmd_ptr = ge_cmd + 2;
-    GE_CMD(TBP0, ((u32)screen_pixels & 0x00FFFFFF));
-    GE_CMD(TBW0, (((u32)screen_pixels & 0xFF000000) >> 8) |
-     MANIA_PITCH);
-    ge_cmd_ptr = old_ge_cmd_ptr;
+    //ge_cmd_ptr = ge_cmd + 2;
+    //GE_CMD(TBP0, ((u32)screen_pixels & 0x00FFFFFF));
+    //GE_CMD(TBW0, (((u32)screen_pixels & 0xFF000000) >> 8) |
+    // MANIA_PITCH);
+    //ge_cmd_ptr = old_ge_cmd_ptr;
     sceGeListEnQueue(ge_cmd, ge_cmd_ptr, gecbid, NULL);
 
   switch (videoSettings.screenCount) {
@@ -231,9 +231,10 @@ void RenderDevice::FlipScreen()
     case 4:
       break;
   }
-  //sceDisplayWaitVblankStart();
-    //sceGuFinish();
-    //sceGuSync(0, 0);
+  sceDisplayWaitVblankStart();
+    sceGuFinish();
+    sceGuSync(0, 0);
+    sceGuStart(GU_DIRECT, display_list);
   /*
   if (windowRefreshDelay > 0) {
     windowRefreshDelay--;
