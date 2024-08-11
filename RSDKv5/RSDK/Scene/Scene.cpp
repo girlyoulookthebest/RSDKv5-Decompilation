@@ -1346,68 +1346,11 @@ void RSDK::DrawLayerHScroll(TileLayer *layer)
                 uint8 *pixels = &tilesetPixels[TILE_DATASIZE * (*layout & 0xFFF) + sheetY];
 
                 uint8 index = *pixels;
-                if (index)
-                    *frameBuffer = activePalette[index];
-
-                index = pixels[1];
-                if (index)
-                    frameBuffer[1] = activePalette[index];
-
-                index = pixels[2];
-                if (index)
-                    frameBuffer[2] = activePalette[index];
-
-                index = pixels[3];
-                if (index)
-                    frameBuffer[3] = activePalette[index];
-
-                index = pixels[4];
-                if (index)
-                    frameBuffer[4] = activePalette[index];
-
-                index = pixels[5];
-                if (index)
-                    frameBuffer[5] = activePalette[index];
-
-                index = pixels[6];
-                if (index)
-                    frameBuffer[6] = activePalette[index];
-
-                index = pixels[7];
-                if (index)
-                    frameBuffer[7] = activePalette[index];
-
-                index = pixels[8];
-                if (index)
-                    frameBuffer[8] = activePalette[index];
-
-                index = pixels[9];
-                if (index)
-                    frameBuffer[9] = activePalette[index];
-
-                index = pixels[10];
-                if (index)
-                    frameBuffer[10] = activePalette[index];
-
-                index = pixels[11];
-                if (index)
-                    frameBuffer[11] = activePalette[index];
-
-                index = pixels[12];
-                if (index)
-                    frameBuffer[12] = activePalette[index];
-
-                index = pixels[13];
-                if (index)
-                    frameBuffer[13] = activePalette[index];
-
-                index = pixels[14];
-                if (index)
-                    frameBuffer[14] = activePalette[index];
-
-                index = pixels[15];
-                if (index)
-                    frameBuffer[15] = activePalette[index];
+                for(uint8 ppx = 0;ppx<16;ppx++){
+                    index = pixels[ppx];
+                    if (index)
+                        frameBuffer[ppx] = activePalette[index];
+                }
             }
 
             frameBuffer += TILE_SIZE;
@@ -1499,53 +1442,10 @@ void RSDK::DrawLayerVScroll(TileLayer *layer)
             else {
                 uint8 *pixels = &tilesetPixels[TILE_DATASIZE * (*layout & 0xFFF) + sheetX];
 
-                if (*pixels)
-                    *frameBuffer = activePalette[*pixels];
-
-                if (pixels[0x10])
-                    frameBuffer[currentScreen->pitch * 1] = activePalette[pixels[0x10]];
-
-                if (pixels[0x20])
-                    frameBuffer[currentScreen->pitch * 2] = activePalette[pixels[0x20]];
-
-                if (pixels[0x30])
-                    frameBuffer[currentScreen->pitch * 3] = activePalette[pixels[0x30]];
-
-                if (pixels[0x40])
-                    frameBuffer[currentScreen->pitch * 4] = activePalette[pixels[0x40]];
-
-                if (pixels[0x50])
-                    frameBuffer[currentScreen->pitch * 5] = activePalette[pixels[0x50]];
-
-                if (pixels[0x60])
-                    frameBuffer[currentScreen->pitch * 6] = activePalette[pixels[0x60]];
-
-                if (pixels[0x70])
-                    frameBuffer[currentScreen->pitch * 7] = activePalette[pixels[0x70]];
-
-                if (pixels[0x80])
-                    frameBuffer[currentScreen->pitch * 8] = activePalette[pixels[0x80]];
-
-                if (pixels[0x90])
-                    frameBuffer[currentScreen->pitch * 9] = activePalette[pixels[0x90]];
-
-                if (pixels[0xA0])
-                    frameBuffer[currentScreen->pitch * 10] = activePalette[pixels[0xA0]];
-
-                if (pixels[0xB0])
-                    frameBuffer[currentScreen->pitch * 11] = activePalette[pixels[0xB0]];
-
-                if (pixels[0xC0])
-                    frameBuffer[currentScreen->pitch * 12] = activePalette[pixels[0xC0]];
-
-                if (pixels[0xD0])
-                    frameBuffer[currentScreen->pitch * 13] = activePalette[pixels[0xD0]];
-
-                if (pixels[0xE0])
-                    frameBuffer[currentScreen->pitch * 14] = activePalette[pixels[0xE0]];
-
-                if (pixels[0xF0])
-                    frameBuffer[currentScreen->pitch * 15] = activePalette[pixels[0xF0]];
+                for(uint8 ppx = 0;ppx<16;ppx++){
+                    if (pixels[(ppx<<4)])
+                        frameBuffer[currentScreen->pitch * ppx] = activePalette[pixels[(ppx<<4)]];
+                }
 
                 frameBuffer += currentScreen->pitch * TILE_SIZE;
             }
@@ -1689,68 +1589,12 @@ void RSDK::DrawLayerBasic(TileLayer *layer)
                     uint8 *pixels = &tilesetPixels[TILE_DATASIZE * (*layout & 0xFFF) + TILE_SIZE * sheetY];
                     for (int32 y = 0; y < tileRemainY; ++y) {
                         uint8 index = *pixels;
-                        if (index)
-                            *frameBuffer = activePalette[index];
 
-                        index = pixels[1];
-                        if (index)
-                            frameBuffer[1] = activePalette[index];
-
-                        index = pixels[2];
-                        if (index)
-                            frameBuffer[2] = activePalette[index];
-
-                        index = pixels[3];
-                        if (index)
-                            frameBuffer[3] = activePalette[index];
-
-                        index = pixels[4];
-                        if (index)
-                            frameBuffer[4] = activePalette[index];
-
-                        index = pixels[5];
-                        if (index)
-                            frameBuffer[5] = activePalette[index];
-
-                        index = pixels[6];
-                        if (index)
-                            frameBuffer[6] = activePalette[index];
-
-                        index = pixels[7];
-                        if (index)
-                            frameBuffer[7] = activePalette[index];
-
-                        index = pixels[8];
-                        if (index)
-                            frameBuffer[8] = activePalette[index];
-
-                        index = pixels[9];
-                        if (index)
-                            frameBuffer[9] = activePalette[index];
-
-                        index = pixels[10];
-                        if (index)
-                            frameBuffer[10] = activePalette[index];
-
-                        index = pixels[11];
-                        if (index)
-                            frameBuffer[11] = activePalette[index];
-
-                        index = pixels[12];
-                        if (index)
-                            frameBuffer[12] = activePalette[index];
-
-                        index = pixels[13];
-                        if (index)
-                            frameBuffer[13] = activePalette[index];
-
-                        index = pixels[14];
-                        if (index)
-                            frameBuffer[14] = activePalette[index];
-
-                        index = pixels[15];
-                        if (index)
-                            frameBuffer[15] = activePalette[index];
+                        for(uint8 ppx = 0;ppx<16;ppx++){
+                            index = pixels[ppx];
+                            if (index)
+                                frameBuffer[ppx] = activePalette[index];
+                        }
 
                         frameBuffer += currentScreen->pitch;
                         pixels += TILE_SIZE;
@@ -1837,68 +1681,11 @@ void RSDK::DrawLayerBasic(TileLayer *layer)
 
                     for (int32 y = 0; y < TILE_SIZE; ++y) {
                         uint8 index = *pixels;
-                        if (index)
-                            *frameBuffer = activePalette[index];
-
-                        index = pixels[1];
-                        if (index)
-                            frameBuffer[1] = activePalette[index];
-
-                        index = pixels[2];
-                        if (index)
-                            frameBuffer[2] = activePalette[index];
-
-                        index = pixels[3];
-                        if (index)
-                            frameBuffer[3] = activePalette[index];
-
-                        index = pixels[4];
-                        if (index)
-                            frameBuffer[4] = activePalette[index];
-
-                        index = pixels[5];
-                        if (index)
-                            frameBuffer[5] = activePalette[index];
-
-                        index = pixels[6];
-                        if (index)
-                            frameBuffer[6] = activePalette[index];
-
-                        index = pixels[7];
-                        if (index)
-                            frameBuffer[7] = activePalette[index];
-
-                        index = pixels[8];
-                        if (index)
-                            frameBuffer[8] = activePalette[index];
-
-                        index = pixels[9];
-                        if (index)
-                            frameBuffer[9] = activePalette[index];
-
-                        index = pixels[10];
-                        if (index)
-                            frameBuffer[10] = activePalette[index];
-
-                        index = pixels[11];
-                        if (index)
-                            frameBuffer[11] = activePalette[index];
-
-                        index = pixels[12];
-                        if (index)
-                            frameBuffer[12] = activePalette[index];
-
-                        index = pixels[13];
-                        if (index)
-                            frameBuffer[13] = activePalette[index];
-
-                        index = pixels[14];
-                        if (index)
-                            frameBuffer[14] = activePalette[index];
-
-                        index = pixels[15];
-                        if (index)
-                            frameBuffer[15] = activePalette[index];
+                        for(uint8 ppx = 0;ppx<16;ppx++){
+                            index = pixels[ppx];
+                            if (index)
+                                frameBuffer[ppx] = activePalette[index];
+                        }
 
                         pixels += TILE_SIZE;
                         frameBuffer += currentScreen->pitch;
@@ -1988,68 +1775,11 @@ void RSDK::DrawLayerBasic(TileLayer *layer)
                     uint8 *pixels = &tilesetPixels[TILE_DATASIZE * (*layout & 0xFFF)];
                     for (int32 y = 0; y < sheetY; ++y) {
                         uint8 index = *pixels;
-                        if (index)
-                            *frameBuffer = activePalette[index];
-
-                        index = pixels[1];
-                        if (index)
-                            frameBuffer[1] = activePalette[index];
-
-                        index = pixels[2];
-                        if (index)
-                            frameBuffer[2] = activePalette[index];
-
-                        index = pixels[3];
-                        if (index)
-                            frameBuffer[3] = activePalette[index];
-
-                        index = pixels[4];
-                        if (index)
-                            frameBuffer[4] = activePalette[index];
-
-                        index = pixels[5];
-                        if (index)
-                            frameBuffer[5] = activePalette[index];
-
-                        index = pixels[6];
-                        if (index)
-                            frameBuffer[6] = activePalette[index];
-
-                        index = pixels[7];
-                        if (index)
-                            frameBuffer[7] = activePalette[index];
-
-                        index = pixels[8];
-                        if (index)
-                            frameBuffer[8] = activePalette[index];
-
-                        index = pixels[9];
-                        if (index)
-                            frameBuffer[9] = activePalette[index];
-
-                        index = pixels[10];
-                        if (index)
-                            frameBuffer[10] = activePalette[index];
-
-                        index = pixels[11];
-                        if (index)
-                            frameBuffer[11] = activePalette[index];
-
-                        index = pixels[12];
-                        if (index)
-                            frameBuffer[12] = activePalette[index];
-
-                        index = pixels[13];
-                        if (index)
-                            frameBuffer[13] = activePalette[index];
-
-                        index = pixels[14];
-                        if (index)
-                            frameBuffer[14] = activePalette[index];
-
-                        index = pixels[15];
-                        if (index)
-                            frameBuffer[15] = activePalette[index];
+                        for(uint8 ppx = 0;ppx<16;ppx++){
+                            index = pixels[ppx];
+                            if (index)
+                                frameBuffer[ppx] = activePalette[index];
+                        }
 
                         pixels += TILE_SIZE;
                         frameBuffer += currentScreen->pitch;

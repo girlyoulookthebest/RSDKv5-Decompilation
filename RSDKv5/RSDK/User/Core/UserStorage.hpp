@@ -191,7 +191,7 @@ struct UserDBStorage {
 
     static bool32 LoadCB(uint16 tableID, int32 status);
     static bool32 SaveCB(uint16 tableID, int32 status);
-
+#if !(__psp__)
     UserDB userDB[RETRO_USERDB_MAX];
     uint8 unknown;
     int32 *writeBuffer[RETRO_USERDB_MAX];
@@ -202,6 +202,7 @@ struct UserDBStorage {
     bool32 (*dbSaveCB[RETRO_USERDB_MAX])(uint16 table, int32 status);
     void (*callbacks[RETRO_USERDB_MAX])(int32);
     int32 unused[RETRO_USERDB_MAX];
+    #endif
 };
 
 extern UserDBStorage *userDBStorage;
@@ -305,6 +306,9 @@ inline void ClearAllUserDBs() { userDBStorage->ClearAllUserDBs(); }
 // UserDB rows
 inline int32 AddUserDBRow(uint16 tableID)
 {
+    #if (__psp__)
+    return -1;
+    #else
     if (tableID == (uint16)-1)
         return -1;
     UserDB *userDB = &userDBStorage->userDB[tableID];
@@ -312,9 +316,13 @@ inline int32 AddUserDBRow(uint16 tableID)
         return -1;
 
     return userDB->AddRow();
+    #endif
 }
 inline bool32 RemoveDBRow(uint16 tableID, uint16 rowID)
 {
+    #if (__psp__)
+    return false;
+    #else
     if (tableID == (uint16)-1 || rowID == (uint16)-1)
         return false;
 
@@ -323,9 +331,13 @@ inline bool32 RemoveDBRow(uint16 tableID, uint16 rowID)
         return false;
 
     return userDB->RemoveRow(rowID);
+    #endif
 }
 inline bool32 RemoveAllDBRows(uint16 tableID)
 {
+    #if (__psp__)
+    return false;
+    #else
     if (tableID == (uint16)-1)
         return false;
 
@@ -334,9 +346,13 @@ inline bool32 RemoveAllDBRows(uint16 tableID)
         return false;
 
     return userDB->RemoveAllRows();
+    #endif
 }
 inline uint16 GetUserDBRowByID(uint16 tableID, uint32 uuid)
 {
+    #if (__psp__)
+    return -1;
+    #else
     if (tableID == (uint16)-1 || !uuid)
         return -1;
 
@@ -345,10 +361,14 @@ inline uint16 GetUserDBRowByID(uint16 tableID, uint32 uuid)
         return -1;
 
     return userDB->GetRowByID(uuid);
+    #endif
 }
 
 inline uint32 GetDBRowUUID(uint16 tableID, uint16 rowID)
 {
+    #if (__psp__)
+    return 0;
+    #else
     if (tableID == (uint16)-1 || rowID == (uint16)-1)
         return 0;
 
@@ -357,6 +377,7 @@ inline uint32 GetDBRowUUID(uint16 tableID, uint16 rowID)
         return 0;
 
     return userDB->rows[rowID].uuid;
+    #endif
 }
 
 // UserDB Row Sorting
@@ -377,7 +398,7 @@ void GetUserDBRowCreationTime(uint16 tableID, uint16 rowID, char *buf, size_t si
 // =======================
 // USER DB CALLBACKS
 // =======================
-
+#if !(__psp__)
 void UserDBStorage_LoadCB1(int32 status);
 void UserDBStorage_LoadCB2(int32 status);
 void UserDBStorage_LoadCB3(int32 status);
@@ -395,6 +416,7 @@ void UserDBStorage_SaveCB5(int32 status);
 void UserDBStorage_SaveCB6(int32 status);
 void UserDBStorage_SaveCB7(int32 status);
 void UserDBStorage_SaveCB8(int32 status);
+#endif
 #endif
 
 extern void (*preLoadSaveFileCB)();

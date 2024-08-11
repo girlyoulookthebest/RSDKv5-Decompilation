@@ -192,56 +192,16 @@ void RGBtoBGR()
         }
 }
 
-// https://github.com/JeffRuLz/Sonic-1-2-2013-Decompilation/blob/main/RSDKv4/3ds/3ds.cpp#L141
+
 void RenderDevice::FlipScreen()
 {
-    //RGBtoBGR();
-    //u32 *old_ge_cmd_ptr = ge_cmd_ptr;
     sceKernelDcacheWritebackAll();
-    // Render the current screen
-    //ge_cmd_ptr = ge_cmd + 2;
-    //GE_CMD(TBP0, ((u32)screen_pixels & 0x00FFFFFF));
-    //GE_CMD(TBW0, (((u32)screen_pixels & 0xFF000000) >> 8) |
-    // MANIA_PITCH);
-    //ge_cmd_ptr = old_ge_cmd_ptr;
     sceGeListEnQueue(ge_cmd, ge_cmd_ptr, gecbid, NULL);
-
-  switch (videoSettings.screenCount) {
-    default:
-    case 0:
-      // image/video buffer, break
-      break;
-    case 1:
-    //memcpy(screen_pixels,screens[0].frameBuffer,MANIA_HEIGHT * (MANIA_WIDTH+16) * sizeof(uint16));
-      //screen_pixels = screens[0].frameBuffer;
-      
-      
-      /*for (int y = 0; y < MANIA_WIDTH; y++) {
-          for (int x = 0; x < MANIA_HEIGHT; x++) {
-            dst[((x * 512) + (512 - y - 1))] = *src++;
-          }
-        }*/
-    //sceGuCopyImage(GU_PSM_5650,0,0,480,272,512,screens[0].frameBuffer,0,0,512,(void*)(((unsigned int)framebuffer)+0x4000000));
-      break;
-
-    // the separate screens used for competition mode will likely 
-    // never be supported by the 3DS port
-    case 2:
-    case 3:
-    case 4:
-      break;
-  }
-  sceDisplayWaitVblankStart();
+    sceDisplayWaitVblankStart();
     sceGuFinish();
     sceGuSync(0, 0);
     sceGuStart(GU_DIRECT, display_list);
-  /*
-  if (windowRefreshDelay > 0) {
-    windowRefreshDelay--;
-    if (!windowRefreshDelay)
-      UpdateGameWindow();
-  }
-  */
+
 }
 
 void RenderDevice::Release(bool32 isRefresh)
