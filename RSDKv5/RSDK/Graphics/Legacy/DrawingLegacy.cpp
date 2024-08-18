@@ -1801,8 +1801,8 @@ void RSDK::Legacy::DrawSpriteRotated(int32 direction, int32 XPos, int32 YPos, in
         angle += 0x200;
     if (angle)
         angle = 0x200 - angle;
-    int32 sine   = sin512LookupTable[angle];
-    int32 cosine = cos512LookupTable[angle];
+    int32 sine   = Sin512(angle);
+    int32 cosine = Cos512(angle);
     int32 xPositions[4];
     int32 yPositions[4];
 
@@ -1952,8 +1952,8 @@ void RSDK::Legacy::DrawSpriteRotozoom(int32 direction, int32 XPos, int32 YPos, i
         angle += 0x200;
     if (angle)
         angle = 0x200 - angle;
-    int32 sine   = scale * sin512LookupTable[angle] >> 9;
-    int32 cosine = scale * cos512LookupTable[angle] >> 9;
+    int32 sine   = scale * Sin512(angle) >> 9;
+    int32 cosine = scale * Cos512(angle) >> 9;
     int32 xPositions[4];
     int32 yPositions[4];
 
@@ -1982,8 +1982,8 @@ void RSDK::Legacy::DrawSpriteRotozoom(int32 direction, int32 XPos, int32 YPos, i
         yPositions[3] = YPos + ((cosine * b - sine * a) >> 9);
     }
     int32 truescale = (int32)(float)((float)(512.0 / (float)scale) * 512.0);
-    sine            = truescale * sin512LookupTable[angle] >> 9;
-    cosine          = truescale * cos512LookupTable[angle] >> 9;
+    sine            = truescale * Sin512(angle) >> 9;
+    cosine          = truescale * Cos512(angle) >> 9;
 
     int32 left = GFX_LINESIZE;
     for (int32 i = 0; i < 4; ++i) {

@@ -89,8 +89,8 @@ void RSDK::Legacy::v4::MatrixScaleXYZ(Matrix *matrix, int32 scaleX, int32 scaleY
 }
 void RSDK::Legacy::v4::MatrixRotateX(Matrix *matrix, int32 rotationX)
 {
-    int32 sine   = sin512LookupTable[rotationX & 0x1FF] >> 1;
-    int32 cosine = cos512LookupTable[rotationX & 0x1FF] >> 1;
+    int32 sine   = Sin512(rotationX & 0x1FF) >> 1;
+    int32 cosine = Cos512(rotationX & 0x1FF) >> 1;
 
     matrix->values[0][0] = 0x100;
     matrix->values[0][1] = 0;
@@ -114,8 +114,8 @@ void RSDK::Legacy::v4::MatrixRotateX(Matrix *matrix, int32 rotationX)
 }
 void RSDK::Legacy::v4::MatrixRotateY(Matrix *matrix, int32 rotationY)
 {
-    int32 sine   = sin512LookupTable[rotationY & 0x1FF] >> 1;
-    int32 cosine = cos512LookupTable[rotationY & 0x1FF] >> 1;
+    int32 sine   = Sin512(rotationY & 0x1FF) >> 1;
+    int32 cosine = Cos512(rotationY & 0x1FF) >> 1;
 
     matrix->values[0][0] = cosine;
     matrix->values[0][1] = 0;
@@ -139,8 +139,8 @@ void RSDK::Legacy::v4::MatrixRotateY(Matrix *matrix, int32 rotationY)
 }
 void RSDK::Legacy::v4::MatrixRotateZ(Matrix *matrix, int32 rotationZ)
 {
-    int32 sine           = sin512LookupTable[rotationZ & 0x1FF] >> 1;
-    int32 cosine         = cos512LookupTable[rotationZ & 0x1FF] >> 1;
+    int32 sine           = Sin512(rotationZ & 0x1FF) >> 1;
+    int32 cosine         = Cos512(rotationZ & 0x1FF) >> 1;
     matrix->values[0][0] = cosine;
     matrix->values[0][1] = 0;
     matrix->values[0][2] = sine;
@@ -163,12 +163,12 @@ void RSDK::Legacy::v4::MatrixRotateZ(Matrix *matrix, int32 rotationZ)
 }
 void RSDK::Legacy::v4::MatrixRotateXYZ(Matrix *matrix, int16 rotationX, int16 rotationY, int16 rotationZ)
 {
-    int32 sinX = sin512LookupTable[rotationX & 0x1FF] >> 1;
-    int32 cosX = cos512LookupTable[rotationX & 0x1FF] >> 1;
-    int32 sinY = sin512LookupTable[rotationY & 0x1FF] >> 1;
-    int32 cosY = cos512LookupTable[rotationY & 0x1FF] >> 1;
-    int32 sinZ = sin512LookupTable[rotationZ & 0x1FF] >> 1;
-    int32 cosZ = cos512LookupTable[rotationZ & 0x1FF] >> 1;
+    int32 sinX = Sin512(rotationX & 0x1FF) >> 1;
+    int32 cosX = Cos512(rotationX & 0x1FF) >> 1;
+    int32 sinY = Sin512(rotationY & 0x1FF) >> 1;
+    int32 cosY = Cos512(rotationY & 0x1FF) >> 1;
+    int32 sinZ = Sin512(rotationZ & 0x1FF) >> 1;
+    int32 cosZ = Cos512(rotationZ & 0x1FF) >> 1;
 
     matrix->values[0][0] = (cosZ * cosY >> 8) + (sinZ * (sinY * sinX >> 8) >> 8);
     matrix->values[0][1] = (sinZ * cosY >> 8) - (cosZ * (sinY * sinX >> 8) >> 8);

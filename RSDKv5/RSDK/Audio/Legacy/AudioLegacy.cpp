@@ -1,4 +1,4 @@
-
+#if RETRO_AUDIO
 
 int32 RSDK::Legacy::globalSFXCount = 0;
 int32 RSDK::Legacy::stageSFXCount  = 0;
@@ -143,4 +143,5 @@ void RSDK::Legacy::v3::SetSfxName(const char *sfxName, int32 sfxID, bool32 globa
     sfxNamePtr[sfxPtrPos] = 0;
     PrintLog(PRINT_NORMAL, "Set %s SFX (%d) name to: %s", (global ? "Global" : "Stage"), sfxID, sfxNamePtr);
 }
+#endif
 #endif

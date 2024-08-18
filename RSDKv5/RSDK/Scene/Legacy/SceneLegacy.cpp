@@ -389,13 +389,13 @@ void RSDK::Legacy::SetLayerDeformation(int32 selectedDef, int32 waveLength, int3
     if (waveType == 1) {
         id = YPos;
         for (int32 i = 0; i < waveSize; ++i) {
-            deformPtr[id] = waveWidth * sin512LookupTable[(i << 9) / waveLength & 0x1FF] >> shift;
+            deformPtr[id] = waveWidth * Sin512((i << 9) / waveLength & 0x1FF) >> shift;
             ++id;
         }
     }
     else {
         for (int32 i = 0; i < 0x200 * 0x100; i += 0x200) {
-            int32 sine    = waveWidth * sin512LookupTable[i / waveLength & 0x1FF] >> shift;
+            int32 sine    = waveWidth * Sin512(i / waveLength & 0x1FF) >> shift;
             deformPtr[id] = sine;
             if (deformPtr[id] >= waveWidth)
                 deformPtr[id] = waveWidth - 1;

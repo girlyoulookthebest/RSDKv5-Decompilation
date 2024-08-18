@@ -148,7 +148,86 @@ inline void ClearStageSfx(){
 }
 
 #if RETRO_REV0U
-#include "Legacy/AudioLegacy.hpp"
+namespace Legacy
+{
+#define LEGACY_TRACK_COUNT (0x10)
+struct TrackInfo {
+    char fileName[0x40];
+    bool32 trackLoop;
+    uint32 loopPoint;
+};
+
+ static int32 globalSFXCount = 0;
+ static int32 stageSFXCount = 0;
+
+ static int32 musicVolume = 0;
+ static int32 sfxVolume = 0;
+ static int32 bgmVolume = 0;
+ static int32 musicCurrentTrack = 0;
+ static int32 musicChannel = 0;
+
+extern TrackInfo musicTracks[LEGACY_TRACK_COUNT];
+
+inline void SetMusicTrack(const char *filePath, uint8 trackID, bool32 loop, uint32 loopPoint)
+{
+    return;
+}
+
+inline int32 PlayMusic(int32 trackID)
+{
+    return -1;
+}
+
+inline void SetMusicVolume(int32 volume)
+{
+    return;
+}
+
+inline void LoadSfx(char *filename, uint8 slot, uint8 scope)
+{
+    return;
+}
+
+inline void StopMusic() { StopChannel(musicChannel); }
+inline int32 PlaySfx(int32 sfxID, bool32 loop) { return RSDK::PlaySfx(sfxID, loop, 0xFF); }
+inline void StopSfx(int32 sfxID) { RSDK::StopSfx(sfxID); }
+
+namespace v3
+{
+extern char globalSfxNames[SFX_COUNT][0x40];
+extern char stageSfxNames[SFX_COUNT][0x40];
+inline void SetSfxAttributes(int32 channelID, int32 loop, int8 pan)
+{
+    return;
+}
+#if RETRO_USE_MOD_LOADER
+inline void SetSfxName(const char *sfxName, int32 sfxID, bool32 global)
+{
+    return;
+}
+#endif
+
+} // namespace v3
+
+namespace v4
+{
+extern float musicRatio;
+extern char sfxNames[SFX_COUNT][0x40];
+inline void SetSfxName(const char *sfxName, int32 sfxID)
+{
+    return;
+}
+inline void SetSfxAttributes(int32 sfxID, int32 loop, int8 pan)
+{
+    return;
+}
+inline void SwapMusicTrack(const char *filePath, uint8 trackID, uint32 loopPoint, uint32 ratio)
+{
+    return;
+}
+} // namespace v4
+
+} // namespace Legacy
 #endif
 
 } // namespace RSDK
