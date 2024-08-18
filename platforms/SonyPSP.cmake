@@ -36,8 +36,8 @@ else()
 endif()
 endif()
 
-target_compile_options(RetroEngine PRIVATE -Os -fpermissive)
-target_compile_options(${GAME_NAME} PRIVATE -Os -fpermissive) 
+target_compile_options(RetroEngine PRIVATE -O3 -fpermissive)
+target_compile_options(${GAME_NAME} PRIVATE -O3 -fpermissive) 
 
 
 
