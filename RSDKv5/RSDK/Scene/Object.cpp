@@ -343,23 +343,18 @@ void RSDK::InitObjects()
         AddCamera(&screens[0].position, TO_FIXED(screens[0].center.x), TO_FIXED(screens[0].center.y), false);
 }
 #if RETRO_RENDERDEVICE_GU
-// Splits the frame's non-rendering time (measured at ~12ms in GHZ1 gameplay,
-// half of all compute) into entity updates vs. draw-list traversal. Both are
-// wrapped at the function level so every call site is covered.
+// Splits the frame's non-rendering time into entity updates vs. draw-list traversal
 #include <psputils.h>
 SceUInt64 gu_objUpdateUsecAccum   = 0;
 SceUInt64 gu_objDrawListUsecAccum = 0;
 #endif
 
 // ProcessObjects used to walk all ENTITY_COUNT (2368) slots three separate
-// times per frame. The second and third passes only ever act on entities the
+// times per frame. WTF. The second and third passes only ever act on entities the
 // first pass already marked inRange, so for a scene using a small fraction of
 // those slots the other two passes were almost entirely cache misses on dead
-// entries -- ~2368 lines pulled in per pass, twice, for nothing.
-//
-// The first pass now records which slots came out inRange, and the other two
-// iterate that list instead. Measured at ~4.3-5.5ms/frame in GHZ1 gameplay,
-// this was the second largest item in the frame after tile layers.
+// entries 2368 lines pulled in per pass, twice, for nothing.
+
 static uint16 inRangeEntities[ENTITY_COUNT];
 static int32 inRangeEntityCount = 0;
 
@@ -504,14 +499,6 @@ void RSDK::ProcessObjects()
     for (int32 i = 0; i < TYPEGROUP_COUNT; ++i) typeGroups[i].entryCount = 0;
 
     // Walk the candidate list the pass above built rather than every slot.
-    //
-    // The inRange re-check is NOT redundant: the list records which entities
-    // were inRange at the time pass one visited them, but the update()
-    // callbacks it invokes can destroy entities or drop them out of range
-    // afterwards. The original code re-read inRange here for exactly that
-    // reason. Skipping the check let a destroyed entity reach
-    // typeGroups[classID] with a stale classID -- an out-of-bounds write that
-    // corrupted memory and crashed later with a wild read.
     for (int32 i = 0; i < inRangeEntityCount; ++i) {
         const int32 e        = inRangeEntities[i];
         sceneInfo.entity     = &objectEntityList[e];
@@ -527,7 +514,7 @@ void RSDK::ProcessObjects()
         }
     }
 
-    // Likewise: lateUpdate only ran for inRange entities. onScreen is reset
+    // Likewise.... lateUpdate only ran for inRange entities. onScreen is reset
     // here for those, and in the first pass for everything that isn't
     // inRange, so every entity still gets cleared exactly once per frame.
     for (int32 i = 0; i < inRangeEntityCount; ++i) {
