@@ -7,6 +7,45 @@
 
     PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
     PSP_MAIN_THREAD_STACK_SIZE_KB(2048);
+
+// HOME button support.
+//
+// The PSP only offers the quit prompt to an app that has registered an exit
+// callback -- with none registered, HOME does nothing at all, which is why
+// the only way out of this port was through the game's own menus.
+//
+// The callback deliberately does NOT call sceKernelExitGame(). The engine's
+// shutdown path (end of RunRetroEngine) releases the audio device, writes
+// Settings.ini via SaveSettingsINI() and closes storage; tearing the process
+// down from the callback thread would skip all of that, and could truncate a
+// save file that happened to be mid-write. Instead this just asks the main
+// loop to stop, and main() exits for real once RunRetroEngine has unwound --
+// at most one frame later, since the loop re-checks isRunning every pass.
+static int PSP_ExitCallback(int arg1, int arg2, void *common)
+{
+    RSDK::RenderDevice::isRunning = false;
+    return 0;
+}
+
+// Callbacks are only delivered to a thread parked in a callback-aware wait,
+// hence sceKernelSleepThreadCB() rather than sceKernelSleepThread(). This is
+// the standard pspsdk arrangement.
+static int PSP_CallbackThread(SceSize args, void *argp)
+{
+    int cbid = sceKernelCreateCallback("Exit Callback", PSP_ExitCallback, NULL);
+    if (cbid >= 0)
+        sceKernelRegisterExitCallback(cbid);
+
+    sceKernelSleepThreadCB();
+    return 0;
+}
+
+static void PSP_SetupCallbacks()
+{
+    int thid = sceKernelCreateThread("update_thread", PSP_CallbackThread, 0x11, 0xFA0, THREAD_ATTR_USER, NULL);
+    if (thid >= 0)
+        sceKernelStartThread(thid, 0, NULL);
+}
 #endif
 
 #if RETRO_STANDALONE
@@ -86,8 +125,17 @@ void android_main(struct android_app *ap)
 int32 main(int32 argc, char *argv[]) {
     #ifdef __psp__
     PSP_HEAP_SIZE_KB(-128);
-    #endif
+    PSP_SetupCallbacks();
+
+    int32 exitCode = RSDK_main(argc, argv, (void *)LinkGameLogic);
+
+    // Hand the system back to the XMB. Reached both on a HOME quit (once the
+    // engine's shutdown has run) and on a normal quit from the game's menu.
+    sceKernelExitGame();
+    return exitCode;
+    #else
     return RSDK_main(argc, argv, (void *)LinkGameLogic);
+    #endif
     }
 #endif
 
