@@ -321,11 +321,7 @@ void DrawLayerRotozoom(TileLayer *layer);
 void DrawLayerBasic(TileLayer *layer);
 
 #if RETRO_RENDERDEVICE_GU
-// PSP only: queues this layer's draw for the unified per-frame GU draw
-// queue (see GU/GURenderDevice.cpp) instead of drawing it immediately.
-// Snapshots the shared `scanlines` buffer at call time, since it's
-// overwritten by the next layer's ProcessParallax()/scanlineCallback
-// before a deferred draw would otherwise run.
+// PSP only: queues this layer's draw for the unified per-frame GU draw queue (see GU/GURenderDevice.cpp) instead of drawing it immediately.
 void GU_QueueLayerDraw(TileLayer *layer);
 #endif
 
