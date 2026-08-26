@@ -1,12 +1,12 @@
 #include "RSDK/Core/RetroEngine.hpp"
 #include "main.hpp"
 #include <pspkernel.h>
-#include <pspdebug.h>
 
 #if __psp__
     PSP_MODULE_INFO("Sonic_Mania", 0, 1, 1);
 
     PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
+    PSP_MAIN_THREAD_STACK_SIZE_KB(2048);
 #endif
 
 #if RETRO_STANDALONE
@@ -83,12 +83,11 @@ void android_main(struct android_app *ap)
     SwappyGL_destroy();
 }
 #else
-int32 main(int32 argc, char *argv[]) { 
-    #ifdef __PSP__
+int32 main(int32 argc, char *argv[]) {
+    #ifdef __psp__
     PSP_HEAP_SIZE_KB(-128);
-
     #endif
-    return RSDK_main(argc, argv, (void *)LinkGameLogic); 
+    return RSDK_main(argc, argv, (void *)LinkGameLogic);
     }
 #endif
 

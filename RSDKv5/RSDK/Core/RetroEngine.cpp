@@ -33,6 +33,15 @@ int32 RSDK::RunRetroEngine(int32 argc, char *argv[])
     if (InitStorage()) {
         SKU::InitUserCore();
         LoadSettingsINI();
+#ifdef __psp__
+        // A settings.ini persisted on the memory stick from early testing (before
+        // streaming audio worked at all) has Audio:streamsEnabled=n written into
+        // it, which silently disables all music playback -- and the title menu
+        // waits on the stream to start before it'll let you proceed past it, so
+        // this also caused a hang on the loading spinner after pressing Start.
+        // Force it on rather than rely on whatever's already written to that file.
+        engine.streamsEnabled = true;
+#endif
 
 #if !RETRO_USE_ORIGINAL_CODE
         // temp fix till i properly figure out what exactly went wrong here

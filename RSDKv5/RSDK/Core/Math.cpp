@@ -3,7 +3,6 @@
 
 using namespace RSDK;
 
-#if !defined(__psp__)
 int32 RSDK::sin1024LookupTable[0x400];
 int32 RSDK::cos1024LookupTable[0x400];
 int32 RSDK::tan1024LookupTable[0x400];
@@ -23,12 +22,10 @@ int32 RSDK::asin256LookupTable[0x100];
 int32 RSDK::acos256LookupTable[0x100];
 
 uint8 RSDK::arcTan256LookupTable[0x100 * 0x100];
-#endif
 uint32 RSDK::randSeed = 0;
 
 void RSDK::ClearTrigLookupTables()
 {
-    #if !defined(__psp__)
     memset(sin256LookupTable, 0, sizeof(sin256LookupTable));
     memset(cos256LookupTable, 0, sizeof(cos256LookupTable));
     memset(tan256LookupTable, 0, sizeof(tan256LookupTable));
@@ -45,7 +42,6 @@ void RSDK::ClearTrigLookupTables()
     memset(asin1024LookupTable, 0, sizeof(asin1024LookupTable));
     memset(acos1024LookupTable, 0, sizeof(acos1024LookupTable));
     memset(arcTan256LookupTable, 0, sizeof(arcTan256LookupTable));
-    #endif
     randSeed = 0;
 }
 
@@ -53,7 +49,6 @@ void RSDK::CalculateTrigAngles()
 {
     srand((uint32)time(NULL));
     randSeed = rand();
-    #if !defined(__psp__)
     for (int32 i = 0; i < 0x400; ++i) {
         sin1024LookupTable[i]  = (int32)(sinf((i / 512.f) * RSDK_PI) * 1024.f);
         cos1024LookupTable[i]  = (int32)(cosf((i / 512.f) * RSDK_PI) * 1024.f);
@@ -117,7 +112,6 @@ void RSDK::CalculateTrigAngles()
             arcTan += 0x100;
         }
     }
-    #endif
 }
 
 uint8 RSDK::ArcTanLookup(int32 X, int32 Y)
@@ -137,7 +131,6 @@ uint8 RSDK::ArcTanLookup(int32 X, int32 Y)
             y >>= 4;
         }
     }
-    #if !defined(__psp__)
     if (X <= 0) {
         if (Y <= 0)
             return arcTan256LookupTable[(x << 8) + y] + 0x80;
@@ -148,16 +141,4 @@ uint8 RSDK::ArcTanLookup(int32 X, int32 Y)
         return -arcTan256LookupTable[(x << 8) + y];
     else
         return arcTan256LookupTable[(x << 8) + y];
-    #else
-    if (X <= 0) {
-        if (Y <= 0)
-            return (int32)(float)((float)atan2((float)y, x) * 40.743664f) + 0x80;
-        else
-            return 0x80 - (int32)(float)((float)atan2((float)y, x) * 40.743664f);
-    }
-    else if (Y <= 0)
-        return -(int32)(float)((float)atan2((float)y, x) * 40.743664f);
-    else
-        return (int32)(float)((float)atan2((float)y, x) * 40.743664f);
-    #endif
 }

@@ -39,6 +39,8 @@ float linearInterpolationLookup[LINEAR_INTERPOLATION_LOOKUP_LENGTH];
 #include "MiniAudio/MiniAudioDevice.cpp"
 #elif RETRO_AUDIODEVICE_OBOE
 #include "Oboe/OboeAudioDevice.cpp"
+#elif RETRO_AUDIODEVICE_PSP
+#include "PSP/PSPAudioDevice.cpp"
 #endif
 
 uint8 AudioDeviceBase::initializedAudioChannels = false;
@@ -215,6 +217,7 @@ void RSDK::LoadStream(ChannelInfo *channel)
     if (channel->state != CHANNEL_LOADING_STREAM)
         return;
 
+
     stb_vorbis_close(vorbisInfo);
 
     FileInfo info;
@@ -224,21 +227,29 @@ void RSDK::LoadStream(ChannelInfo *channel)
         streamBufferSize = info.fileSize;
         streamBuffer     = NULL;
         AllocateStorage((void **)&streamBuffer, info.fileSize, DATASET_MUS, false);
-        ReadBytes(&info, streamBuffer, streamBufferSize);
-        CloseFile(&info);
 
-        if (streamBufferSize > 0) {
-            vorbisAlloc.alloc_buffer_length_in_bytes = 512 * 1024; // 512KiB
-            AllocateStorage((void **)&vorbisAlloc.alloc_buffer, 512 * 1024, DATASET_MUS, false);
+        if (streamBuffer) {
+            ReadBytes(&info, streamBuffer, streamBufferSize);
+            CloseFile(&info);
 
-            vorbisInfo = stb_vorbis_open_memory(streamBuffer, streamBufferSize, NULL, &vorbisAlloc);
-            if (vorbisInfo) {
-                if (streamStartPos)
-                    stb_vorbis_seek(vorbisInfo, streamStartPos);
-                UpdateStreamBuffer(channel);
+            if (streamBufferSize > 0) {
+                vorbisAlloc.alloc_buffer_length_in_bytes = 512 * 1024; // 512KiB
+                AllocateStorage((void **)&vorbisAlloc.alloc_buffer, 512 * 1024, DATASET_MUS, false);
 
-                channel->state = CHANNEL_STREAM;
+                if (vorbisAlloc.alloc_buffer) {
+                    vorbisInfo = stb_vorbis_open_memory(streamBuffer, streamBufferSize, NULL, &vorbisAlloc);
+                    if (vorbisInfo) {
+                        if (streamStartPos)
+                            stb_vorbis_seek(vorbisInfo, streamStartPos);
+                        UpdateStreamBuffer(channel);
+
+                        channel->state = CHANNEL_STREAM;
+                    }
+                }
             }
+        }
+        else {
+            CloseFile(&info);
         }
     }
 
@@ -378,6 +389,17 @@ void RSDK::LoadSfxToSlot(char *filename, uint8 slot, uint8 plays, uint8 scope)
 
                 AllocateStorage((void **)&sfxList[slot].buffer, sizeof(float) * length, DATASET_SFX, false);
                 sfxList[slot].length = length;
+
+#if !RETRO_USE_ORIGINAL_CODE
+                // AllocateStorage() silently leaves the buffer NULL if the SFX pool is full
+                // instead of failing loudly, so the write loop below would otherwise segfault.
+                if (!sfxList[slot].buffer) {
+                    sfxList[slot].scope = SCOPE_NONE;
+                    CloseFile(&info);
+                    PrintLog(PRINT_ERROR, "Not enough SFX storage to load: %s", filename);
+                    return;
+                }
+#endif
 
                 // Convert the sample data to F32 format
                 float *buffer = (float *)sfxList[slot].buffer;

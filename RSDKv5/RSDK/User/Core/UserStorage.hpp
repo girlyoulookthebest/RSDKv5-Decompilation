@@ -12,6 +12,23 @@ namespace SKU
 #define RETRO_USERDB_COL_MAX (8)
 #define RETRO_USERDB_ROW_MAX (0x400)
 
+#if RETRO_PLATFORM == RETRO_PSP
+// Wrong assumption originally: this port DOES populate user DB tables --
+// ReplayDB.bin (Objects/Helpers/ReplayDB.c) and TimeAttackDB.bin
+// (Objects/Helpers/TimeAttackData.c) each call API.InitUserDB with their own
+// table name, and both are needed concurrently once the main menu loads.
+// Shrinking RETRO_USERDB_MAX to 1 meant only the first of the two could ever
+// get a table slot -- the second's InitUserDB/LoadUserDB call silently failed,
+// which left ManiaModeMenu_InitAPI() waiting forever on a status that could
+// never reach STATUS_OK, stuck showing the loading spinner. Sized to comfortably
+// cover both DBs plus headroom, while still cutting the stock 8x1024 sizing
+// (~2.2MB) down to a fraction of that for this platform's tighter RAM budget.
+#undef RETRO_USERDB_MAX
+#undef RETRO_USERDB_ROW_MAX
+#define RETRO_USERDB_MAX     (4)
+#define RETRO_USERDB_ROW_MAX (256)
+#endif
+
 // no clue what this is...
 // most signatures are recognisable like "SCN" for scenes
 // but as far as I can tell, this one is just random numbers?

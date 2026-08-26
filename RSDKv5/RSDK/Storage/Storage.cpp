@@ -38,6 +38,20 @@ bool32 RSDK::InitStorage()
     #if !RETRO_AUDIO
     dataStorage[DATASET_MUS].storageLimit = 0;
     dataStorage[DATASET_SFX].storageLimit = 0;
+    #elif RETRO_PLATFORM == RETRO_PSP
+    // The desktop-sized SFX/MUS pools (20MiB + ~4.19MiB) don't fit in the PSP's
+    // available heap alongside the other pools. LoadStream() reads a whole
+    // compressed music file into this pool at once (not a rolling window), so
+    // this needs to comfortably fit the largest track's file size.
+    dataStorage[DATASET_MUS].storageLimit = 3 * 1024 * 1024;  // 3 Mib
+    dataStorage[DATASET_SFX].storageLimit = 15 * 1024 * 1024;  // 15 Mib -- trimmed another 1MiB to give TMP room below
+    // LoadSceneAssets() allocates a temp EntityBase array (SCENEENTITY_COUNT *
+    // sizeof(EntityBase) = 2048 * 1112 = ~2.17MiB) from this pool on every
+    // scene load. At 2MiB that allocation always failed silently (AllocateStorage
+    // returns NULL on failure with no error signaled) and the caller dereferenced
+    // the NULL pointer -- crashed hard on real hardware, but PPSSPP tolerated the
+    // bad access silently, which is why this only ever showed up on real PSP.
+    dataStorage[DATASET_TMP].storageLimit = 3 * 1024 * 1024;  // 3 Mib -- must comfortably exceed the ~2.29MiB peak this pool needs during scene load
     #endif
 
     for (int32 s = 0; s < DATASET_MAX; ++s) {

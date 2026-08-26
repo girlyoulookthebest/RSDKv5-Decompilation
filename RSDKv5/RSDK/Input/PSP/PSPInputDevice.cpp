@@ -25,39 +25,47 @@ void RSDK::SKU::InputDevicePSP::UpdateInput()
   SceCtrlData ctrl_data;
   sceCtrlPeekBufferPositive(&ctrl_data, 1);
   
-  int32 kDown = ctrl_data.Buttons;
-  int32 kHeld = ctrl_data.Buttons & last_buttons;
+  int32 kDown  = ctrl_data.Buttons;
+  int32 kPress = kDown & ~last_buttons; // rising edge: down now, wasn't down last frame
 
-  if (kDown || kHeld)
+  if (kDown)
     this->anyPress = 1;
 
   for (int i = 0; i < 12; i++) {
     mappings[i].down = kDown & remap[i];
-    mappings[i].press = kHeld & remap[i];
+    mappings[i].press = kPress & remap[i];
   }
   last_buttons = ctrl_data.Buttons;
 }
 
-// TODO: the code below *technically* works, but is kind of a mess.
-// Clean up later.
+// RSDK::ProcessInput() (Input.cpp) runs a shared edge-detector over every
+// device's output: it expects each backend to report the RAW "is this button
+// held right now" state into .press every frame, and it derives the real
+// one-frame .press / sustained .down pair from that itself (see the
+// `if (cont[i]->press) { if (cont[i]->down) cont[i]->press = false; else
+// cont[i]->down = true; } else cont[i]->down = false;` loop). Feeding it
+// mappings[i].press (which is only true on the single rising-edge frame, per
+// UpdateInput's kPress calculation) instead of mappings[i].down (true for as
+// long as the button stays held) meant every button read as released again
+// one frame after being pressed -- held input like walking never sustained.
 void RSDK::SKU::InputDevicePSP::ProcessInput(int32 controllerID)
 {
   for (int i = 0; i < PLAYER_COUNT; i++) {
     if (i == 2)
       continue;
 
-    controller[i].keyUp.press       |= mappings[0].press;
-    controller[i].keyDown.press     |= mappings[1].press;
-    controller[i].keyLeft.press     |= mappings[2].press;
-    controller[i].keyRight.press    |= mappings[3].press;
-    controller[i].keyA.press        |= mappings[4].press;
-    controller[i].keyB.press        |= mappings[5].press;
-    controller[i].keyC.press        |= mappings[6].press;
-    controller[i].keyX.press        |= mappings[7].press;
-    controller[i].keyY.press        |= mappings[8].press;
-    controller[i].keyZ.press        |= mappings[9].press;
-    controller[i].keyStart.press    |= mappings[10].press;
-    controller[i].keySelect.press   |= mappings[11].press;
+    controller[i].keyUp.press       |= mappings[0].down;
+    controller[i].keyDown.press     |= mappings[1].down;
+    controller[i].keyLeft.press     |= mappings[2].down;
+    controller[i].keyRight.press    |= mappings[3].down;
+    controller[i].keyA.press        |= mappings[4].down;
+    controller[i].keyB.press        |= mappings[5].down;
+    controller[i].keyC.press        |= mappings[6].down;
+    controller[i].keyX.press        |= mappings[7].down;
+    controller[i].keyY.press        |= mappings[8].down;
+    controller[i].keyZ.press        |= mappings[9].down;
+    controller[i].keyStart.press    |= mappings[10].down;
+    controller[i].keySelect.press   |= mappings[11].down;
   }
 }
 
