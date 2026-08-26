@@ -591,26 +591,59 @@ void RSDK::FillScreen(uint32 color, int32 alphaR, int32 alphaG, int32 alphaB)
     alphaG = CLAMP(alphaG, 0x00, 0xFF);
     alphaB = CLAMP(alphaB, 0x00, 0xFF);
 
-    if (alphaR + alphaG + alphaB) {
-        validDraw        = true;
-        uint16 clrBlendB = blendLookupTable[0x20 * alphaR + rgb32To16_R[(color >> 0x10) & 0xFF]];
-        uint16 clrBlendG = blendLookupTable[0x20 * alphaG + rgb32To16_R[(color >> 0x08) & 0xFF]];
-        uint16 clrBlendR = blendLookupTable[0x20 * alphaB + rgb32To16_R[(color >> 0x00) & 0xFF]];
+    if (!(alphaR + alphaG + alphaB))
+        return;
 
-        uint16 *fbBlendB = &blendLookupTable[0x20 * (0xFF - alphaR)];
-        uint16 *fbBlendG = &blendLookupTable[0x20 * (0xFF - alphaG)];
-        uint16 *fbBlendR = &blendLookupTable[0x20 * (0xFF - alphaB)];
+    validDraw = true;
 
-        int32 cnt = currentScreen->size.y * currentScreen->pitch;
-        for (int32 id = 0; cnt > 0; --cnt, ++id) {
-            uint16 px = currentScreen->frameBuffer[id];
+#if RETRO_RENDERDEVICE_GU
+    // Queued rather than applied here directly -- see the declaration of
+    // FillScreen_CPU in Drawing.hpp for why order relative to sprite/layer
+    // draws matters for this one.
+    GU_QueueFillScreen(color, alphaR, alphaG, alphaB);
+}
 
-            int32 R = fbBlendR[(px & 0xF800) >> 11] + clrBlendR;
-            int32 G = fbBlendG[(px & 0x7E0) >> 6] + clrBlendG;
-            int32 B = fbBlendB[px & 0x1F] + clrBlendB;
+void RSDK::FillScreen_CPU(uint32 color, int32 alphaR, int32 alphaG, int32 alphaB)
+{
+#endif
+    uint16 clrBlendB = blendLookupTable[0x20 * alphaR + rgb32To16_R[(color >> 0x10) & 0xFF]];
+    uint16 clrBlendG = blendLookupTable[0x20 * alphaG + rgb32To16_R[(color >> 0x08) & 0xFF]];
+    uint16 clrBlendR = blendLookupTable[0x20 * alphaB + rgb32To16_R[(color >> 0x00) & 0xFF]];
 
-            currentScreen->frameBuffer[id] = (B) | (G << 6) | (R << 11);
-        }
+    uint16 *fbBlendB = &blendLookupTable[0x20 * (0xFF - alphaR)];
+    uint16 *fbBlendG = &blendLookupTable[0x20 * (0xFF - alphaG)];
+    uint16 *fbBlendR = &blendLookupTable[0x20 * (0xFF - alphaB)];
+
+    // The framebuffer pointer is hoisted into a local and walked directly,
+    // rather than indexing currentScreen->frameBuffer[id] each iteration.
+    // currentScreen is a global pointer and the loop stores through it, so
+    // the compiler cannot prove the store doesn't alias currentScreen itself
+    // and has to reload both currentScreen and ->frameBuffer for EVERY pixel
+    // -- two extra dependent loads per pixel on an in-order CPU that stalls
+    // on each one. Measured on hardware, this loop was costing ~12.5ms per
+    // call (~40 cycles/pixel for ~10 instructions' worth of work), making it
+    // the single most expensive draw type in the frame by a wide margin.
+    // Row by row over size.x, NOT one run of size.y*pitch. Pitch is a stride,
+    // not a width: the visible area is size.x wide and the rest of each row
+    // is padding. Treating pitch as the width used to be harmless when the
+    // two were nearly equal (424 vs 432) and the padding was off-screen, but
+    // the frame is now presented 1:1 inside a 512-stride display-sized
+    // surface, so the padding IS the visible border -- filling it painted
+    // over the border, and cost 21% more pixels than necessary besides.
+    // BISECT: back to the original single contiguous run over size.y*pitch.
+    // The row-wise version was introduced for the 1:1 presentation experiment
+    // (where the row padding became the visible border); with the fullscreen
+    // blit restored the padding is off-screen again.
+    uint16 *fb    = currentScreen->frameBuffer;
+    uint16 *fbEnd = fb + (currentScreen->size.y * currentScreen->pitch);
+    for (; fb < fbEnd; ++fb) {
+        uint16 px = *fb;
+
+        int32 R = fbBlendR[(px & 0xF800) >> 11] + clrBlendR;
+        int32 G = fbBlendG[(px & 0x7E0) >> 6] + clrBlendG;
+        int32 B = fbBlendB[px & 0x1F] + clrBlendB;
+
+        *fb = (B) | (G << 6) | (R << 11);
     }
 }
 
@@ -1196,8 +1229,25 @@ void RSDK::DrawRectangle(int32 x, int32 y, int32 width, int32 height, uint32 col
     if (width <= 0 || height <= 0)
         return;
 
+    validDraw = true;
+
+#if RETRO_RENDERDEVICE_GU
+    // Same reasoning as DrawSpriteFlipped/FillScreen: this has to go through
+    // the unified queue too, or a rectangle drawn immediately (as it was
+    // pre-Stage-0) could end up UNDER a deferred FillScreen dim or sprite
+    // text that was originally drawn on top of it, silently disappearing
+    // once the dim replays after it at frame end instead of before.
+    GU_QueueRectDraw(x, y, width, height, color, alpha, inkEffect);
+}
+
+// The actual CPU rasterizer, split out for the same reason as
+// DrawSpriteFlipped_CPU/FillScreen_CPU -- see those for details. `color` is
+// already byte-swapped and `inkEffect` already resolved (INK_ALPHA may have
+// been downgraded to INK_NONE) by the caller above.
+void RSDK::DrawRectangle_CPU(int32 x, int32 y, int32 width, int32 height, uint32 color, int32 alpha, int32 inkEffect)
+{
+#endif
     int32 pitch         = currentScreen->pitch - width;
-    validDraw           = true;
     uint16 *frameBuffer = &currentScreen->frameBuffer[x + (y * currentScreen->pitch)];
     uint16 color16      = rgb32To16_R[(color >> 0) & 0xFF] | rgb32To16_G[(color >> 8) & 0xFF] | rgb32To16_B[(color >> 16) & 0xFF];
 
@@ -1347,6 +1397,25 @@ void RSDK::DrawCircle(int32 x, int32 y, int32 radius, uint32 color, int32 alpha,
             y = FROM_FIXED(y) - currentScreen->position.y;
         }
 
+#if RETRO_RENDERDEVICE_GU
+        // Same reasoning as DrawFace: the whole body (scanEdgeBuffer
+        // computation via the Bresenham circle loop, then the blit that
+        // reads it) has to replay together, so this defers the whole thing
+        // rather than splitting at a "pre-clipped coordinates" boundary.
+        // This is what drives circular iris wipe transitions (e.g. the
+        // scene-load transition) -- being left undeferred while
+        // surrounding sprite/layer/fillscreen content was already deferred
+        // is exactly the kind of ordering bug that made those invisible.
+        GU_QueueCircleDraw(x, y, radius, color, alpha, inkEffect);
+        return;
+    }
+}
+
+// The actual rasterizer, split out for the same reason as DrawFace_CPU.
+void RSDK::DrawCircle_CPU(int32 x, int32 y, int32 radius, uint32 color, int32 alpha, int32 inkEffect)
+{
+    {
+#endif
         int32 yRadiusBottom = y + radius;
         int32 bottom        = yRadiusBottom + 1;
         int32 yRadiusTop    = y - radius;
@@ -1445,8 +1514,12 @@ void RSDK::DrawCircle(int32 x, int32 y, int32 radius, uint32 color, int32 alpha,
                                 edge->end = currentScreen->clipBound_X2;
 
                             int32 count = edge->end - edge->start;
+                            // edge->start hoisted out of the per-pixel loop: the loop writes
+                            // through frameBuffer, which the compiler cannot prove doesn't alias
+                            // `edge`, so it reloaded edge->start for every single pixel.
+                            uint16 *dst = &frameBuffer[edge->start];
                             for (int32 x = 0; x < count; ++x) {
-                                frameBuffer[edge->start + x] = color16;
+                                dst[x] = color16;
                             }
                             ++edge;
                             frameBuffer += currentScreen->pitch;
@@ -1471,8 +1544,12 @@ void RSDK::DrawCircle(int32 x, int32 y, int32 radius, uint32 color, int32 alpha,
                                 edge->end = currentScreen->clipBound_X2;
 
                             int32 count = edge->end - edge->start;
+                            // edge->start hoisted out of the per-pixel loop: the loop writes
+                            // through frameBuffer, which the compiler cannot prove doesn't alias
+                            // `edge`, so it reloaded edge->start for every single pixel.
+                            uint16 *dst = &frameBuffer[edge->start];
                             for (int32 x = 0; x < count; ++x) {
-                                setPixelBlend(color16, frameBuffer[edge->start + x]);
+                                setPixelBlend(color16, dst[x]);
                             }
 
                             ++edge;
@@ -1501,8 +1578,12 @@ void RSDK::DrawCircle(int32 x, int32 y, int32 radius, uint32 color, int32 alpha,
                                 edge->end = currentScreen->clipBound_X2;
 
                             int32 count = edge->end - edge->start;
+                            // edge->start hoisted out of the per-pixel loop: the loop writes
+                            // through frameBuffer, which the compiler cannot prove doesn't alias
+                            // `edge`, so it reloaded edge->start for every single pixel.
+                            uint16 *dst = &frameBuffer[edge->start];
                             for (int32 x = 0; x < count; ++x) {
-                                setPixelAlpha(color16, frameBuffer[edge->start + x], alpha);
+                                setPixelAlpha(color16, dst[x], alpha);
                             }
                             ++edge;
                             frameBuffer += currentScreen->pitch;
@@ -1528,8 +1609,12 @@ void RSDK::DrawCircle(int32 x, int32 y, int32 radius, uint32 color, int32 alpha,
                                 edge->end = currentScreen->clipBound_X2;
 
                             int32 count = edge->end - edge->start;
+                            // edge->start hoisted out of the per-pixel loop: the loop writes
+                            // through frameBuffer, which the compiler cannot prove doesn't alias
+                            // `edge`, so it reloaded edge->start for every single pixel.
+                            uint16 *dst = &frameBuffer[edge->start];
                             for (int32 x = 0; x < count; ++x) {
-                                setPixelAdditive(color16, frameBuffer[edge->start + x]);
+                                setPixelAdditive(color16, dst[x]);
                             }
                             ++edge;
                             frameBuffer += currentScreen->pitch;
@@ -1556,8 +1641,12 @@ void RSDK::DrawCircle(int32 x, int32 y, int32 radius, uint32 color, int32 alpha,
                                 edge->end = currentScreen->clipBound_X2;
 
                             int32 count = edge->end - edge->start;
+                            // edge->start hoisted out of the per-pixel loop: the loop writes
+                            // through frameBuffer, which the compiler cannot prove doesn't alias
+                            // `edge`, so it reloaded edge->start for every single pixel.
+                            uint16 *dst = &frameBuffer[edge->start];
                             for (int32 x = 0; x < count; ++x) {
-                                setPixelSubtractive(color16, frameBuffer[edge->start + x]);
+                                setPixelSubtractive(color16, dst[x]);
                             }
                             ++edge;
                             frameBuffer += currentScreen->pitch;
@@ -1583,8 +1672,12 @@ void RSDK::DrawCircle(int32 x, int32 y, int32 radius, uint32 color, int32 alpha,
                                 edge->end = currentScreen->clipBound_X2;
 
                             int32 count = edge->end - edge->start;
+                            // edge->start hoisted out of the per-pixel loop: the loop writes
+                            // through frameBuffer, which the compiler cannot prove doesn't alias
+                            // `edge`, so it reloaded edge->start for every single pixel.
+                            uint16 *dst = &frameBuffer[edge->start];
                             for (int32 x = 0; x < count; ++x) {
-                                frameBuffer[edge->start + x] = tintLookupTable[frameBuffer[edge->start + x]];
+                                dst[x] = tintLookupTable[dst[x]];
                             }
                             ++edge;
                             frameBuffer += currentScreen->pitch;
@@ -1609,9 +1702,13 @@ void RSDK::DrawCircle(int32 x, int32 y, int32 radius, uint32 color, int32 alpha,
                                 edge->end = currentScreen->clipBound_X2;
 
                             int32 count = edge->end - edge->start;
+                            // edge->start hoisted out of the per-pixel loop: the loop writes
+                            // through frameBuffer, which the compiler cannot prove doesn't alias
+                            // `edge`, so it reloaded edge->start for every single pixel.
+                            uint16 *dst = &frameBuffer[edge->start];
                             for (int32 x = 0; x < count; ++x) {
-                                if (frameBuffer[edge->start + x] == maskColor)
-                                    frameBuffer[edge->start + x] = color16;
+                                if (dst[x] == maskColor)
+                                    dst[x] = color16;
                             }
                             ++edge;
                             frameBuffer += currentScreen->pitch;
@@ -1636,9 +1733,13 @@ void RSDK::DrawCircle(int32 x, int32 y, int32 radius, uint32 color, int32 alpha,
                                 edge->end = currentScreen->clipBound_X2;
 
                             int32 count = edge->end - edge->start;
+                            // edge->start hoisted out of the per-pixel loop: the loop writes
+                            // through frameBuffer, which the compiler cannot prove doesn't alias
+                            // `edge`, so it reloaded edge->start for every single pixel.
+                            uint16 *dst = &frameBuffer[edge->start];
                             for (int32 x = 0; x < count; ++x) {
-                                if (frameBuffer[edge->start + x] != maskColor)
-                                    frameBuffer[edge->start + x] = color16;
+                                if (dst[x] != maskColor)
+                                    dst[x] = color16;
                             }
                             ++edge;
                             frameBuffer += currentScreen->pitch;
@@ -1681,6 +1782,15 @@ void RSDK::DrawCircleOutline(int32 x, int32 y, int32 innerRadius, int32 outerRad
         y = FROM_FIXED(y) - currentScreen->position.y;
     }
 
+#if RETRO_RENDERDEVICE_GU
+    // Same reasoning as DrawCircle.
+    GU_QueueCircleOutlineDraw(x, y, innerRadius, outerRadius, color, alpha, inkEffect);
+    return;
+}
+
+void RSDK::DrawCircleOutline_CPU(int32 x, int32 y, int32 innerRadius, int32 outerRadius, uint32 color, int32 alpha, int32 inkEffect)
+{
+#endif
     if (outerRadius > 0 && innerRadius < outerRadius) {
         int32 top    = y - outerRadius;
         int32 left   = x - outerRadius;
@@ -1956,6 +2066,25 @@ void RSDK::DrawFace(Vector2 *vertices, int32 vertCount, int32 b, int32 g, int32 
             break;
     }
 
+#if RETRO_RENDERDEVICE_GU
+    // Same reasoning as DrawSpriteFlipped/DrawRectangle/DrawSpriteRotozoom:
+    // this has to go through the unified queue too. Unlike those, the whole
+    // body here (edge computation via the shared scanEdgeBuffer scratch,
+    // then the blit that reads it) has to be replayed together rather than
+    // split at a "pre-clipped coordinates" boundary -- scanEdgeBuffer is
+    // computed and consumed in one synchronous pass, so deferring the whole
+    // thing is safe as long as vertices are copied (the caller's array may
+    // not survive to flush time) rather than deferred by pointer.
+    GU_QueueFaceDraw(vertices, vertCount, b, g, r, alpha, inkEffect);
+    return;
+}
+
+// The actual rasterizer, split out for the same reason as
+// DrawSpriteFlipped_CPU -- see that for details. Takes a copy of the
+// vertex array rather than the original pointer.
+void RSDK::DrawFace_CPU(Vector2 *vertices, int32 vertCount, int32 b, int32 g, int32 r, int32 alpha, int32 inkEffect)
+{
+#endif
     int32 top    = 0x7FFFFFFF;
     int32 bottom = -0x10000;
     for (int32 v = 0; v < vertCount; ++v) {
@@ -2011,8 +2140,12 @@ void RSDK::DrawFace(Vector2 *vertices, int32 vertCount, int32 b, int32 g, int32 
                         edge->end = currentScreen->clipBound_X2;
 
                     int32 count = edge->end - edge->start;
+                    // edge->start hoisted out of the per-pixel loop: the loop writes
+                    // through frameBuffer, which the compiler cannot prove doesn't alias
+                    // `edge`, so it reloaded edge->start for every single pixel.
+                    uint16 *dst = &frameBuffer[edge->start];
                     for (int32 x = 0; x < count; ++x) {
-                        frameBuffer[edge->start + x] = color16;
+                        dst[x] = color16;
                     }
                     ++edge;
                     frameBuffer += currentScreen->pitch;
@@ -2032,8 +2165,12 @@ void RSDK::DrawFace(Vector2 *vertices, int32 vertCount, int32 b, int32 g, int32 
                         edge->end = currentScreen->clipBound_X2;
 
                     int32 count = edge->end - edge->start;
+                    // edge->start hoisted out of the per-pixel loop: the loop writes
+                    // through frameBuffer, which the compiler cannot prove doesn't alias
+                    // `edge`, so it reloaded edge->start for every single pixel.
+                    uint16 *dst = &frameBuffer[edge->start];
                     for (int32 x = 0; x < count; ++x) {
-                        setPixelBlend(color16, frameBuffer[edge->start + x]);
+                        setPixelBlend(color16, dst[x]);
                     }
                     ++edge;
                     frameBuffer += currentScreen->pitch;
@@ -2056,8 +2193,12 @@ void RSDK::DrawFace(Vector2 *vertices, int32 vertCount, int32 b, int32 g, int32 
                         edge->end = currentScreen->clipBound_X2;
 
                     int32 count = edge->end - edge->start;
+                    // edge->start hoisted out of the per-pixel loop: the loop writes
+                    // through frameBuffer, which the compiler cannot prove doesn't alias
+                    // `edge`, so it reloaded edge->start for every single pixel.
+                    uint16 *dst = &frameBuffer[edge->start];
                     for (int32 x = 0; x < count; ++x) {
-                        setPixelAlpha(color16, frameBuffer[edge->start + x], alpha);
+                        setPixelAlpha(color16, dst[x], alpha);
                     }
                     ++edge;
                     frameBuffer += currentScreen->pitch;
@@ -2080,8 +2221,12 @@ void RSDK::DrawFace(Vector2 *vertices, int32 vertCount, int32 b, int32 g, int32 
                         edge->end = currentScreen->clipBound_X2;
 
                     int32 count = edge->end - edge->start;
+                    // edge->start hoisted out of the per-pixel loop: the loop writes
+                    // through frameBuffer, which the compiler cannot prove doesn't alias
+                    // `edge`, so it reloaded edge->start for every single pixel.
+                    uint16 *dst = &frameBuffer[edge->start];
                     for (int32 x = 0; x < count; ++x) {
-                        setPixelAdditive(color16, frameBuffer[edge->start + x]);
+                        setPixelAdditive(color16, dst[x]);
                     }
 
                     ++edge;
@@ -2104,8 +2249,12 @@ void RSDK::DrawFace(Vector2 *vertices, int32 vertCount, int32 b, int32 g, int32 
                         edge->end = currentScreen->clipBound_X2;
 
                     int32 count = edge->end - edge->start;
+                    // edge->start hoisted out of the per-pixel loop: the loop writes
+                    // through frameBuffer, which the compiler cannot prove doesn't alias
+                    // `edge`, so it reloaded edge->start for every single pixel.
+                    uint16 *dst = &frameBuffer[edge->start];
                     for (int32 x = 0; x < count; ++x) {
-                        setPixelSubtractive(color16, frameBuffer[edge->start + x]);
+                        setPixelSubtractive(color16, dst[x]);
                     }
 
                     ++edge;
@@ -2127,8 +2276,12 @@ void RSDK::DrawFace(Vector2 *vertices, int32 vertCount, int32 b, int32 g, int32 
                         edge->end = currentScreen->clipBound_X2;
 
                     int32 count = edge->end - edge->start;
+                    // edge->start hoisted out of the per-pixel loop: the loop writes
+                    // through frameBuffer, which the compiler cannot prove doesn't alias
+                    // `edge`, so it reloaded edge->start for every single pixel.
+                    uint16 *dst = &frameBuffer[edge->start];
                     for (int32 x = 0; x < count; ++x) {
-                        frameBuffer[edge->start + x] = tintLookupTable[frameBuffer[edge->start + x]];
+                        dst[x] = tintLookupTable[dst[x]];
                     }
 
                     ++edge;
@@ -2149,9 +2302,13 @@ void RSDK::DrawFace(Vector2 *vertices, int32 vertCount, int32 b, int32 g, int32 
                         edge->end = currentScreen->clipBound_X2;
 
                     int32 count = edge->end - edge->start;
+                    // edge->start hoisted out of the per-pixel loop: the loop writes
+                    // through frameBuffer, which the compiler cannot prove doesn't alias
+                    // `edge`, so it reloaded edge->start for every single pixel.
+                    uint16 *dst = &frameBuffer[edge->start];
                     for (int32 x = 0; x < count; ++x) {
-                        if (frameBuffer[edge->start + x] == maskColor)
-                            frameBuffer[edge->start + x] = color16;
+                        if (dst[x] == maskColor)
+                            dst[x] = color16;
                     }
 
                     ++edge;
@@ -2172,9 +2329,13 @@ void RSDK::DrawFace(Vector2 *vertices, int32 vertCount, int32 b, int32 g, int32 
                         edge->end = currentScreen->clipBound_X2;
 
                     int32 count = edge->end - edge->start;
+                    // edge->start hoisted out of the per-pixel loop: the loop writes
+                    // through frameBuffer, which the compiler cannot prove doesn't alias
+                    // `edge`, so it reloaded edge->start for every single pixel.
+                    uint16 *dst = &frameBuffer[edge->start];
                     for (int32 x = 0; x < count; ++x) {
-                        if (frameBuffer[edge->start + x] != maskColor)
-                            frameBuffer[edge->start + x] = color16;
+                        if (dst[x] != maskColor)
+                            dst[x] = color16;
                     }
 
                     ++edge;
@@ -2208,6 +2369,17 @@ void RSDK::DrawBlendedFace(Vector2 *vertices, uint32 *colors, int32 vertCount, i
                 return;
             break;
     }
+
+#if RETRO_RENDERDEVICE_GU
+    // See DrawFace for why this defers the whole body rather than just the
+    // blit tail.
+    GU_QueueBlendedFaceDraw(vertices, colors, vertCount, alpha, inkEffect);
+    return;
+}
+
+void RSDK::DrawBlendedFace_CPU(Vector2 *vertices, uint32 *colors, int32 vertCount, int32 alpha, int32 inkEffect)
+{
+#endif
 
     int32 top    = 0x7FFFFFFF;
     int32 bottom = -0x10000;
@@ -2286,8 +2458,12 @@ void RSDK::DrawBlendedFace(Vector2 *vertices, uint32 *colors, int32 vertCount, i
                         count     = currentScreen->clipBound_X2 - edge->start;
                     }
 
+                    // edge->start hoisted out of the per-pixel loop: the loop writes
+                    // through frameBuffer, which the compiler cannot prove doesn't alias
+                    // `edge`, so it reloaded edge->start for every single pixel.
+                    uint16 *dst = &frameBuffer[edge->start];
                     for (int32 x = 0; x < count; ++x) {
-                        frameBuffer[edge->start + x] = (startB >> 19) + ((startG >> 13) & 0x7E0) + ((startR >> 8) & 0xF800);
+                        dst[x] = (startB >> 19) + ((startG >> 13) & 0x7E0) + ((startR >> 8) & 0xF800);
 
                         startR += deltaR;
                         startG += deltaG;
@@ -2335,9 +2511,13 @@ void RSDK::DrawBlendedFace(Vector2 *vertices, uint32 *colors, int32 vertCount, i
                         count     = currentScreen->clipBound_X2 - edge->start;
                     }
 
+                    // edge->start hoisted out of the per-pixel loop: the loop writes
+                    // through frameBuffer, which the compiler cannot prove doesn't alias
+                    // `edge`, so it reloaded edge->start for every single pixel.
+                    uint16 *dst = &frameBuffer[edge->start];
                     for (int32 x = 0; x < count; ++x) {
                         uint16 color = (startB >> 19) + ((startG >> 13) & 0x7E0) + ((startR >> 8) & 0xF800);
-                        setPixelBlend(color, frameBuffer[edge->start + x]);
+                        setPixelBlend(color, dst[x]);
 
                         startR += deltaR;
                         startG += deltaG;
@@ -2389,9 +2569,13 @@ void RSDK::DrawBlendedFace(Vector2 *vertices, uint32 *colors, int32 vertCount, i
                         count     = currentScreen->clipBound_X2 - edge->start;
                     }
 
+                    // edge->start hoisted out of the per-pixel loop: the loop writes
+                    // through frameBuffer, which the compiler cannot prove doesn't alias
+                    // `edge`, so it reloaded edge->start for every single pixel.
+                    uint16 *dst = &frameBuffer[edge->start];
                     for (int32 x = 0; x < count; ++x) {
                         uint16 color = (startB >> 19) + ((startG >> 13) & 0x7E0) + ((startR >> 8) & 0xF800);
-                        setPixelAlpha(color, frameBuffer[edge->start + x], alpha);
+                        setPixelAlpha(color, dst[x], alpha);
 
                         startR += deltaR;
                         startG += deltaG;
@@ -2442,9 +2626,13 @@ void RSDK::DrawBlendedFace(Vector2 *vertices, uint32 *colors, int32 vertCount, i
                         count     = currentScreen->clipBound_X2 - edge->start;
                     }
 
+                    // edge->start hoisted out of the per-pixel loop: the loop writes
+                    // through frameBuffer, which the compiler cannot prove doesn't alias
+                    // `edge`, so it reloaded edge->start for every single pixel.
+                    uint16 *dst = &frameBuffer[edge->start];
                     for (int32 x = 0; x < count; ++x) {
                         uint16 color = (startB >> 19) + ((startG >> 13) & 0x7E0) + ((startR >> 8) & 0xF800);
-                        setPixelAdditive(color, frameBuffer[edge->start + x]);
+                        setPixelAdditive(color, dst[x]);
 
                         startR += deltaR;
                         startG += deltaG;
@@ -2496,9 +2684,13 @@ void RSDK::DrawBlendedFace(Vector2 *vertices, uint32 *colors, int32 vertCount, i
                         count     = currentScreen->clipBound_X2 - edge->start;
                     }
 
+                    // edge->start hoisted out of the per-pixel loop: the loop writes
+                    // through frameBuffer, which the compiler cannot prove doesn't alias
+                    // `edge`, so it reloaded edge->start for every single pixel.
+                    uint16 *dst = &frameBuffer[edge->start];
                     for (int32 x = 0; x < count; ++x) {
                         uint16 color = (startB >> 19) + ((startG >> 13) & 0x7E0) + ((startR >> 8) & 0xF800);
-                        setPixelSubtractive(color, frameBuffer[edge->start + x]);
+                        setPixelSubtractive(color, dst[x]);
 
                         startR += deltaR;
                         startG += deltaG;
@@ -2556,8 +2748,12 @@ void RSDK::DrawBlendedFace(Vector2 *vertices, uint32 *colors, int32 vertCount, i
                         count     = currentScreen->clipBound_X2 - edge->start;
                     }
 
+                    // edge->start hoisted out of the per-pixel loop: the loop writes
+                    // through frameBuffer, which the compiler cannot prove doesn't alias
+                    // `edge`, so it reloaded edge->start for every single pixel.
+                    uint16 *dst = &frameBuffer[edge->start];
                     for (int32 x = 0; x < count; ++x) {
-                        frameBuffer[edge->start + x] = tintLookupTable[frameBuffer[edge->start + x]];
+                        dst[x] = tintLookupTable[dst[x]];
 
 #if RETRO_USE_ORIGINAL_CODE
                         // Unused, ifdef'd out to help out ports for weaker hardware
@@ -2605,9 +2801,13 @@ void RSDK::DrawBlendedFace(Vector2 *vertices, uint32 *colors, int32 vertCount, i
                         count     = currentScreen->clipBound_X2 - edge->start;
                     }
 
+                    // edge->start hoisted out of the per-pixel loop: the loop writes
+                    // through frameBuffer, which the compiler cannot prove doesn't alias
+                    // `edge`, so it reloaded edge->start for every single pixel.
+                    uint16 *dst = &frameBuffer[edge->start];
                     for (int32 x = 0; x < count; ++x) {
-                        if (frameBuffer[edge->start + x] == maskColor)
-                            frameBuffer[edge->start + x] = (startB >> 19) + ((startG >> 13) & 0x7E0) + ((startR >> 8) & 0xF800);
+                        if (dst[x] == maskColor)
+                            dst[x] = (startB >> 19) + ((startG >> 13) & 0x7E0) + ((startR >> 8) & 0xF800);
 
                         startR += deltaR;
                         startG += deltaG;
@@ -2656,9 +2856,13 @@ void RSDK::DrawBlendedFace(Vector2 *vertices, uint32 *colors, int32 vertCount, i
                         count     = currentScreen->clipBound_X2 - edge->start;
                     }
 
+                    // edge->start hoisted out of the per-pixel loop: the loop writes
+                    // through frameBuffer, which the compiler cannot prove doesn't alias
+                    // `edge`, so it reloaded edge->start for every single pixel.
+                    uint16 *dst = &frameBuffer[edge->start];
                     for (int32 x = 0; x < count; ++x) {
-                        if (frameBuffer[edge->start + x] != maskColor)
-                            frameBuffer[edge->start + x] = (startB >> 19) + ((startG >> 13) & 0x7E0) + ((startR >> 8) & 0xF800);
+                        if (dst[x] != maskColor)
+                            dst[x] = (startB >> 19) + ((startG >> 13) & 0x7E0) + ((startR >> 8) & 0xF800);
 
                         startR += deltaR;
                         startG += deltaG;
@@ -2912,6 +3116,33 @@ void RSDK::DrawSpriteFlipped(int32 x, int32 y, int32 width, int32 height, int32 
 
     GFXSurface *surface = &gfxSurface[sheetID];
     validDraw           = true;
+
+#if RETRO_RENDERDEVICE_GU
+    // Every sprite draw is queued rather than rasterized here directly --
+    // see GU_QueueSpriteDraw() in GU/GURenderDevice.cpp. This is the
+    // unified per-frame draw queue (Stage 0 of the GPU pipeline plan):
+    // everything, GPU-eligible or not, goes through it and is replayed in
+    // original call order at frame end, which is what keeps draw order
+    // correct once GPU-drawn and CPU-drawn content are mixed in the same
+    // frame -- the earlier narrow sprite-only attempt queued GPU-eligible
+    // sprites but drew CPU-fallback ones immediately, which didn't
+    // preserve relative order and contributed to real visual bugs.
+    GU_QueueSpriteDraw(x, y, width, height, sprX, sprY, widthFlip, heightFlip, direction, inkEffect, alpha, sheetID);
+}
+
+// The actual CPU rasterizer, split out so it can be called immediately (by
+// GU_QueueSpriteDraw for non-eligible sprites, in later stages) or replayed
+// from the queue at frame end. Takes already-clipped coordinates -- see the
+// call site above for what's been done to x/y/width/height/sprX/sprY by
+// this point (widthFlip/heightFlip are the pre-clip dimensions, needed by
+// the FLIP_X/FLIP_Y/FLIP_XY source-address math below). Unchanged from the
+// original single-function body otherwise.
+void RSDK::DrawSpriteFlipped_CPU(int32 x, int32 y, int32 width, int32 height, int32 sprX, int32 sprY, int32 widthFlip, int32 heightFlip,
+                                  int32 direction, int32 inkEffect, int32 alpha, int32 sheetID)
+{
+    GFXSurface *surface = &gfxSurface[sheetID];
+#endif
+
     int32 pitch         = currentScreen->pitch - width;
     int32 gfxPitch      = 0;
     uint8 *lineBuffer   = NULL;
@@ -3639,26 +3870,19 @@ void RSDK::DrawSpriteRotozoom(int32 x, int32 y, int32 pivotX, int32 pivotY, int3
     int32 xSize = right - left;
     int32 ySize = bottom - top;
     if (xSize >= 1 && ySize >= 1) {
-        GFXSurface *surface = &gfxSurface[sheetID];
-
-        int32 fullX         = TO_FIXED(sprX + width);
-        int32 fullY         = TO_FIXED(sprY + height);
-        validDraw           = true;
-        int32 fullScaleX    = (int32)((512.0 / (float)scaleX) * 512.0);
-        int32 fullScaleY    = (int32)((512.0 / (float)scaleY) * 512.0);
-        int32 deltaXLen     = fullScaleX * sine >> 2;
-        int32 deltaX        = fullScaleX * cosine >> 2;
-        int32 pitch         = currentScreen->pitch - xSize;
-        int32 deltaYLen     = fullScaleY * cosine >> 2;
-        int32 deltaY        = fullScaleY * sine >> 2;
-        int32 lineSize      = surface->lineSize;
-        uint8 *lineBuffer   = &gfxLineBuffer[top];
-        int32 xLen          = left - x;
-        int32 yLen          = top - y;
-        uint8 *pixels       = surface->pixels;
-        uint16 *frameBuffer = &currentScreen->frameBuffer[left + (top * currentScreen->pitch)];
-        int32 fullSprX      = TO_FIXED(sprX) - 1;
-        int32 fullSprY      = TO_FIXED(sprY) - 1;
+        int32 fullX      = TO_FIXED(sprX + width);
+        int32 fullY      = TO_FIXED(sprY + height);
+        validDraw        = true;
+        int32 fullScaleX = (int32)((512.0 / (float)scaleX) * 512.0);
+        int32 fullScaleY = (int32)((512.0 / (float)scaleY) * 512.0);
+        int32 deltaXLen  = fullScaleX * sine >> 2;
+        int32 deltaX     = fullScaleX * cosine >> 2;
+        int32 deltaYLen  = fullScaleY * cosine >> 2;
+        int32 deltaY     = fullScaleY * sine >> 2;
+        int32 xLen       = left - x;
+        int32 yLen       = top - y;
+        int32 fullSprX   = TO_FIXED(sprX) - 1;
+        int32 fullSprY   = TO_FIXED(sprY) - 1;
 
         int32 drawX = 0, drawY = 0;
         if (direction == FLIP_X) {
@@ -3671,6 +3895,41 @@ void RSDK::DrawSpriteRotozoom(int32 x, int32 y, int32 pivotX, int32 pivotY, int3
             drawX = sprXPos + deltaX * xLen - deltaXLen * yLen;
             drawY = sprYPos + deltaYLen * yLen + deltaY * xLen;
         }
+
+#if RETRO_RENDERDEVICE_GU
+        // Same reasoning as DrawSpriteFlipped/DrawRectangle: this has to go
+        // through the unified queue too, or a rotozoom sprite drawn
+        // immediately (as it was pre-Stage-0) can end up under/over
+        // deferred sprites, layers, or fills it should be layered against,
+        // depending on where in the frame it happened to be called. Passes
+        // through the already-computed clip/transform values below rather
+        // than the raw x/y/pivot/scale/rotation params, since those are the
+        // only things the blit loop actually needs and it keeps the queued
+        // entry's replay independent of anything that changes between now
+        // and flush time other than currentScreen/gfxLineBuffer (both
+        // captured separately, same as every other entry type).
+        GU_QueueRotozoomDraw(left, top, xSize, ySize, fullX, fullY, fullSprX, fullSprY, deltaX, deltaY, deltaXLen, deltaYLen, drawX, drawY,
+                             inkEffect, alpha, sheetID);
+        return;
+    }
+}
+
+// The actual CPU rasterizer, split out for the same reason as
+// DrawSpriteFlipped_CPU -- see that for details. Takes the already-computed
+// clip rect (left/top/xSize/ySize) and per-row/per-pixel transform deltas
+// rather than the original x/y/pivot/scale/rotation params.
+void RSDK::DrawSpriteRotozoom_CPU(int32 left, int32 top, int32 xSize, int32 ySize, int32 fullX, int32 fullY, int32 fullSprX, int32 fullSprY,
+                                   int32 deltaX, int32 deltaY, int32 deltaXLen, int32 deltaYLen, int32 drawX, int32 drawY, int32 inkEffect,
+                                   int32 alpha, int32 sheetID)
+{
+    {
+#endif
+        GFXSurface *surface = &gfxSurface[sheetID];
+        int32 pitch         = currentScreen->pitch - xSize;
+        int32 lineSize      = surface->lineSize;
+        uint8 *lineBuffer   = &gfxLineBuffer[top];
+        uint8 *pixels       = surface->pixels;
+        uint16 *frameBuffer = &currentScreen->frameBuffer[left + (top * currentScreen->pitch)];
 
         switch (inkEffect) {
             case INK_NONE:

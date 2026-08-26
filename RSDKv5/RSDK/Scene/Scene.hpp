@@ -320,6 +320,15 @@ void DrawLayerRotozoom(TileLayer *layer);
 // Draw a "basic" layer, no special capabilities, but it's the fastest to draw
 void DrawLayerBasic(TileLayer *layer);
 
+#if RETRO_RENDERDEVICE_GU
+// PSP only: queues this layer's draw for the unified per-frame GU draw
+// queue (see GU/GURenderDevice.cpp) instead of drawing it immediately.
+// Snapshots the shared `scanlines` buffer at call time, since it's
+// overwritten by the next layer's ProcessParallax()/scanlineCallback
+// before a deferred draw would otherwise run.
+void GU_QueueLayerDraw(TileLayer *layer);
+#endif
+
 #if RETRO_REV0U
 #include "Legacy/SceneLegacy.hpp"
 #endif

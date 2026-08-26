@@ -1,6 +1,34 @@
 #include "RSDK/Core/RetroEngine.hpp"
 
+#include <algorithm> // std::sort, for the face depth sort below
+
 using namespace RSDK;
+
+#if RETRO_RENDERDEVICE_GU
+// Splits the Special Stage's cost inside ProcessObjectDrawLists, which
+// measures 23-117ms/frame on hardware and drops that stage to 6-16fps.
+//
+// Two theories have already been wrong: the face sort (replaced with an
+// O(n log n) sort -- correct, but changed nothing) and the MAX_FACE_VERTS
+// immediate-draw fallback (can't trigger; Scene3D emits 1-4 verts per face).
+// The draw queue also reports zero queued faces while the stage visibly
+// renders, so the time is somewhere none of the existing counters look.
+// Rather than guess a third time, time each stage of the 3D pipeline.
+//
+// Zero cost when profiling is off -- see GU_ENABLE_PROFILING.
+#include <psputils.h>
+SceUInt64 gu_s3dMeshUsec = 0;  // per-vertex transform (AddMeshFrameToScene)
+SceUInt64 gu_s3dSortUsec = 0;  // depth sort
+SceUInt64 gu_s3dDrawUsec = 0;  // face rasterizing
+extern int32 gu_profilingEnabled;
+#define S3D_TIME_BEGIN(acc) const SceUInt64 acc##_t0 = gu_profilingEnabled ? sceKernelGetSystemTimeWide() : 0
+#define S3D_TIME_END(acc)                                                                                                                            \
+    if (gu_profilingEnabled)                                                                                                                         \
+    acc += sceKernelGetSystemTimeWide() - acc##_t0
+#else
+#define S3D_TIME_BEGIN(acc) ((void)0)
+#define S3D_TIME_END(acc) ((void)0)
+#endif
 
 #if RETRO_REV0U
 #include "Legacy/Scene3DLegacy.cpp"
@@ -511,9 +539,33 @@ uint16 RSDK::Create3DScene(const char *name, uint16 vertexLimit, uint8 scope)
 }
 void RSDK::AddModelToScene(uint16 modelFrames, uint16 sceneIndex, uint8 drawMode, Matrix *matWorld, Matrix *matNormals, color color)
 {
+    // Counted into the same bucket as AddMeshFrameToScene: both are per-vertex
+    // transform work, and only the mesh variant was instrumented before --
+    // which left a large slice of the Special Stage's draw-list time invisible.
+    S3D_TIME_BEGIN(gu_s3dMeshUsec);
     if (modelFrames < MODEL_COUNT && sceneIndex < SCENE3D_COUNT) {
         if (matWorld) {
             Model *mdl            = &modelList[modelFrames];
+            // Matrix elements hoisted into locals.
+            //
+            // The transform loops below write through `vertex`, which the
+            // compiler cannot prove doesn't alias the Matrix these are read
+            // from -- so every one of the 12 values was reloaded for EVERY
+            // vertex. The Special Stage transforms thousands of vertices per
+            // frame, making this the hottest redundant read in the 3D path.
+            const int32 mw00 = matWorld->values[0][0], mw01 = matWorld->values[0][1], mw02 = matWorld->values[0][2],
+                        mw03 = matWorld->values[0][3];
+            const int32 mw10 = matWorld->values[1][0], mw11 = matWorld->values[1][1], mw12 = matWorld->values[1][2],
+                        mw13 = matWorld->values[1][3];
+            const int32 mw20 = matWorld->values[2][0], mw21 = matWorld->values[2][1], mw22 = matWorld->values[2][2],
+                        mw23 = matWorld->values[2][3];
+            const int32 mn00 = matNormals ? matNormals->values[0][0] : 0, mn01 = matNormals ? matNormals->values[0][1] : 0,
+                        mn02 = matNormals ? matNormals->values[0][2] : 0;
+            const int32 mn10 = matNormals ? matNormals->values[1][0] : 0, mn11 = matNormals ? matNormals->values[1][1] : 0,
+                        mn12 = matNormals ? matNormals->values[1][2] : 0;
+            const int32 mn20 = matNormals ? matNormals->values[2][0] : 0, mn21 = matNormals ? matNormals->values[2][1] : 0,
+                        mn22 = matNormals ? matNormals->values[2][2] : 0;
+
             Scene3D *scn          = &scene3DList[sceneIndex];
             uint16 *indices       = mdl->indices;
             int32 vertID          = scn->vertexCount;
@@ -537,12 +589,12 @@ void RSDK::AddModelToScene(uint16 modelFrames, uint16 sceneIndex, uint8 drawMode
                                 ModelVertex *modelVert = &mdl->vertices[indices[i++]];
                                 Scene3DVertex *vertex  = &scn->vertices[vertID++];
 
-                                vertex->x = matWorld->values[0][3] + (modelVert->z * matWorld->values[0][2] >> 8)
-                                            + (matWorld->values[0][0] * modelVert->x >> 8) + (matWorld->values[0][1] * modelVert->y >> 8);
-                                vertex->y = matWorld->values[1][3] + (modelVert->y * matWorld->values[1][1] >> 8)
-                                            + (modelVert->z * matWorld->values[1][2] >> 8) + (matWorld->values[1][0] * modelVert->x >> 8);
-                                vertex->z = matWorld->values[2][3] + ((modelVert->x * matWorld->values[2][0]) >> 8)
-                                            + ((matWorld->values[2][2] * modelVert->z >> 8) + (matWorld->values[2][1] * modelVert->y >> 8));
+                                vertex->x = mw03 + (modelVert->z * mw02 >> 8)
+                                            + (mw00 * modelVert->x >> 8) + (mw01 * modelVert->y >> 8);
+                                vertex->y = mw13 + (modelVert->y * mw11 >> 8)
+                                            + (modelVert->z * mw12 >> 8) + (mw10 * modelVert->x >> 8);
+                                vertex->z = mw23 + ((modelVert->x * mw20) >> 8)
+                                            + ((mw22 * modelVert->z >> 8) + (mw21 * modelVert->y >> 8));
 
                                 vertex->color = color;
                             }
@@ -558,20 +610,20 @@ void RSDK::AddModelToScene(uint16 modelFrames, uint16 sceneIndex, uint8 drawMode
                                     ModelVertex *modelVert = &mdl->vertices[indices[i++]];
                                     Scene3DVertex *vertex  = &scn->vertices[vertID++];
 
-                                    vertex->x = matWorld->values[0][3] + (modelVert->z * matWorld->values[0][2] >> 8)
-                                                + (modelVert->x * matWorld->values[0][0] >> 8) + (modelVert->y * matWorld->values[0][1] >> 8);
-                                    vertex->y = matWorld->values[1][3] + (modelVert->y * matWorld->values[1][1] >> 8)
-                                                + (matWorld->values[1][0] * modelVert->x >> 8) + (modelVert->z * matWorld->values[1][2] >> 8);
-                                    vertex->z = matWorld->values[2][3] + (modelVert->x * matWorld->values[2][0] >> 8)
-                                                + (matWorld->values[2][2] * modelVert->z >> 8) + (matWorld->values[2][1] * modelVert->y >> 8);
+                                    vertex->x = mw03 + (modelVert->z * mw02 >> 8)
+                                                + (modelVert->x * mw00 >> 8) + (modelVert->y * mw01 >> 8);
+                                    vertex->y = mw13 + (modelVert->y * mw11 >> 8)
+                                                + (mw10 * modelVert->x >> 8) + (modelVert->z * mw12 >> 8);
+                                    vertex->z = mw23 + (modelVert->x * mw20 >> 8)
+                                                + (mw22 * modelVert->z >> 8) + (mw21 * modelVert->y >> 8);
 
-                                    vertex->nx = (modelVert->nz * matNormals->values[0][2] >> 8) + (modelVert->nx * matNormals->values[0][0] >> 8)
-                                                 + (matNormals->values[0][1] * modelVert->ny >> 8);
-                                    vertex->ny = (modelVert->ny * matNormals->values[1][1] >> 8) + (modelVert->nz * matNormals->values[1][2] >> 8)
-                                                 + (modelVert->nx * matNormals->values[1][0] >> 8);
+                                    vertex->nx = (modelVert->nz * mn02 >> 8) + (modelVert->nx * mn00 >> 8)
+                                                 + (mn01 * modelVert->ny >> 8);
+                                    vertex->ny = (modelVert->ny * mn11 >> 8) + (modelVert->nz * mn12 >> 8)
+                                                 + (modelVert->nx * mn10 >> 8);
                                     vertex->nz =
-                                        ((modelVert->ny * matNormals->values[2][1]) >> 8)
-                                        + ((matNormals->values[2][0] * modelVert->nx >> 8) + (modelVert->nz * matNormals->values[2][2] >> 8));
+                                        ((modelVert->ny * mn21) >> 8)
+                                        + ((mn20 * modelVert->nx >> 8) + (modelVert->nz * mn22 >> 8));
 
                                     vertex->color = color;
                                 }
@@ -585,12 +637,12 @@ void RSDK::AddModelToScene(uint16 modelFrames, uint16 sceneIndex, uint8 drawMode
                                     ModelVertex *modelVert = &mdl->vertices[indices[i++]];
                                     Scene3DVertex *vertex  = &scn->vertices[vertID++];
 
-                                    vertex->x = matWorld->values[0][3] + (modelVert->z * matWorld->values[0][2] >> 8)
-                                                + (matWorld->values[0][0] * modelVert->x >> 8) + (matWorld->values[0][1] * modelVert->y >> 8);
-                                    vertex->y = matWorld->values[1][3] + (modelVert->y * matWorld->values[1][1] >> 8)
-                                                + (modelVert->z * matWorld->values[1][2] >> 8) + (matWorld->values[1][0] * modelVert->x >> 8);
-                                    vertex->z = matWorld->values[2][3] + ((matWorld->values[2][2] * modelVert->z) >> 8)
-                                                + ((matWorld->values[2][0] * modelVert->x >> 8) + (matWorld->values[2][1] * modelVert->y >> 8));
+                                    vertex->x = mw03 + (modelVert->z * mw02 >> 8)
+                                                + (mw00 * modelVert->x >> 8) + (mw01 * modelVert->y >> 8);
+                                    vertex->y = mw13 + (modelVert->y * mw11 >> 8)
+                                                + (modelVert->z * mw12 >> 8) + (mw10 * modelVert->x >> 8);
+                                    vertex->z = mw23 + ((mw22 * modelVert->z) >> 8)
+                                                + ((mw20 * modelVert->x >> 8) + (mw21 * modelVert->y >> 8));
 
                                     vertex->color = color;
                                 }
@@ -608,20 +660,20 @@ void RSDK::AddModelToScene(uint16 modelFrames, uint16 sceneIndex, uint8 drawMode
                                     Color *modelColor      = &mdl->colors[indices[i++]];
                                     Scene3DVertex *vertex  = &scn->vertices[vertID++];
 
-                                    vertex->x = matWorld->values[0][3] + (matWorld->values[0][2] * modelVert->z >> 8)
-                                                + (modelVert->y * matWorld->values[0][1] >> 8) + (matWorld->values[0][0] * modelVert->x >> 8);
-                                    vertex->y = matWorld->values[1][3] + (matWorld->values[1][2] * modelVert->z >> 8)
-                                                + (modelVert->y * matWorld->values[1][1] >> 8) + (matWorld->values[1][0] * modelVert->x >> 8);
-                                    vertex->z = matWorld->values[2][3] + (modelVert->x * matWorld->values[2][0] >> 8)
-                                                + (modelVert->y * matWorld->values[2][1] >> 8) + (matWorld->values[2][2] * modelVert->z >> 8);
+                                    vertex->x = mw03 + (mw02 * modelVert->z >> 8)
+                                                + (modelVert->y * mw01 >> 8) + (mw00 * modelVert->x >> 8);
+                                    vertex->y = mw13 + (mw12 * modelVert->z >> 8)
+                                                + (modelVert->y * mw11 >> 8) + (mw10 * modelVert->x >> 8);
+                                    vertex->z = mw23 + (modelVert->x * mw20 >> 8)
+                                                + (modelVert->y * mw21 >> 8) + (mw22 * modelVert->z >> 8);
 
-                                    vertex->nx = (matNormals->values[0][0] * modelVert->nx >> 8) + (modelVert->ny * matNormals->values[0][1] >> 8)
-                                                 + (matNormals->values[0][2] * modelVert->nz >> 8);
-                                    vertex->ny = (matNormals->values[1][0] * modelVert->nx >> 8) + (modelVert->ny * matNormals->values[1][1] >> 8)
-                                                 + (matNormals->values[1][2] * modelVert->nz >> 8);
+                                    vertex->nx = (mn00 * modelVert->nx >> 8) + (modelVert->ny * mn01 >> 8)
+                                                 + (mn02 * modelVert->nz >> 8);
+                                    vertex->ny = (mn10 * modelVert->nx >> 8) + (modelVert->ny * mn11 >> 8)
+                                                 + (mn12 * modelVert->nz >> 8);
                                     vertex->nz =
-                                        ((matNormals->values[2][2] * modelVert->nz) >> 8)
-                                        + ((modelVert->ny * matNormals->values[2][1] >> 8) + (matNormals->values[2][0] * modelVert->nx >> 8));
+                                        ((mn22 * modelVert->nz) >> 8)
+                                        + ((modelVert->ny * mn21 >> 8) + (mn20 * modelVert->nx >> 8));
 
                                     vertex->color = modelColor->color;
                                 }
@@ -636,12 +688,12 @@ void RSDK::AddModelToScene(uint16 modelFrames, uint16 sceneIndex, uint8 drawMode
                                     Color *modelColor      = &mdl->colors[indices[i++]];
                                     Scene3DVertex *vertex  = &scn->vertices[vertID++];
 
-                                    vertex->x = matWorld->values[0][3] + (matWorld->values[0][0] * modelVert->x >> 8)
-                                                + (modelVert->y * matWorld->values[0][1] >> 8) + (modelVert->z * matWorld->values[0][2] >> 8);
-                                    vertex->y = matWorld->values[1][3] + (modelVert->z * matWorld->values[1][2] >> 8)
-                                                + (matWorld->values[1][0] * modelVert->x >> 8) + (modelVert->y * matWorld->values[1][1] >> 8);
-                                    vertex->z = matWorld->values[2][3] + (matWorld->values[2][2] * modelVert->z >> 8)
-                                                + (modelVert->y * matWorld->values[2][1] >> 8) + (modelVert->x * matWorld->values[2][0] >> 8);
+                                    vertex->x = mw03 + (mw00 * modelVert->x >> 8)
+                                                + (modelVert->y * mw01 >> 8) + (modelVert->z * mw02 >> 8);
+                                    vertex->y = mw13 + (modelVert->z * mw12 >> 8)
+                                                + (mw10 * modelVert->x >> 8) + (modelVert->y * mw11 >> 8);
+                                    vertex->z = mw23 + (mw22 * modelVert->z >> 8)
+                                                + (modelVert->y * mw21 >> 8) + (modelVert->x * mw20 >> 8);
 
                                     vertex->color = modelColor->color;
                                 }
@@ -652,13 +704,35 @@ void RSDK::AddModelToScene(uint16 modelFrames, uint16 sceneIndex, uint8 drawMode
             }
         }
     }
+    S3D_TIME_END(gu_s3dMeshUsec);
 }
 void RSDK::AddMeshFrameToScene(uint16 modelFrames, uint16 sceneIndex, Animator *animator, uint8 drawMode, Matrix *matWorld, Matrix *matNormals,
                                color color)
 {
+    S3D_TIME_BEGIN(gu_s3dMeshUsec);
     if (modelFrames < MODEL_COUNT && sceneIndex < SCENE3D_COUNT) {
         if (matWorld && animator) {
             Model *mdl            = &modelList[modelFrames];
+            // Matrix elements hoisted into locals.
+            //
+            // The transform loops below write through `vertex`, which the
+            // compiler cannot prove doesn't alias the Matrix these are read
+            // from -- so every one of the 12 values was reloaded for EVERY
+            // vertex. The Special Stage transforms thousands of vertices per
+            // frame, making this the hottest redundant read in the 3D path.
+            const int32 mw00 = matWorld->values[0][0], mw01 = matWorld->values[0][1], mw02 = matWorld->values[0][2],
+                        mw03 = matWorld->values[0][3];
+            const int32 mw10 = matWorld->values[1][0], mw11 = matWorld->values[1][1], mw12 = matWorld->values[1][2],
+                        mw13 = matWorld->values[1][3];
+            const int32 mw20 = matWorld->values[2][0], mw21 = matWorld->values[2][1], mw22 = matWorld->values[2][2],
+                        mw23 = matWorld->values[2][3];
+            const int32 mn00 = matNormals ? matNormals->values[0][0] : 0, mn01 = matNormals ? matNormals->values[0][1] : 0,
+                        mn02 = matNormals ? matNormals->values[0][2] : 0;
+            const int32 mn10 = matNormals ? matNormals->values[1][0] : 0, mn11 = matNormals ? matNormals->values[1][1] : 0,
+                        mn12 = matNormals ? matNormals->values[1][2] : 0;
+            const int32 mn20 = matNormals ? matNormals->values[2][0] : 0, mn21 = matNormals ? matNormals->values[2][1] : 0,
+                        mn22 = matNormals ? matNormals->values[2][2] : 0;
+
             Scene3D *scn          = &scene3DList[sceneIndex];
             uint16 *indices       = mdl->indices;
             int32 vertID          = scn->vertexCount;
@@ -693,12 +767,12 @@ void RSDK::AddMeshFrameToScene(uint16 modelFrames, uint16 sceneIndex, Animator *
                                 int32 z                    = frameVert->z + ((interpolate * (nextFrameVert->z - frameVert->z)) >> 8);
                                 i++;
                                 Scene3DVertex *vertex = &scn->vertices[vertID++];
-                                vertex->x             = matWorld->values[0][3] + (z * matWorld->values[0][2] >> 8) + (matWorld->values[0][0] * x >> 8)
-                                            + (matWorld->values[0][1] * y >> 8);
-                                vertex->y = matWorld->values[1][3] + (y * matWorld->values[1][1] >> 8) + (z * matWorld->values[1][2] >> 8)
-                                            + (matWorld->values[1][0] * x >> 8);
-                                vertex->z = matWorld->values[2][3] + ((x * matWorld->values[2][0]) >> 8)
-                                            + ((matWorld->values[2][2] * z >> 8) + (matWorld->values[2][1] * y >> 8));
+                                vertex->x             = mw03 + (z * mw02 >> 8) + (mw00 * x >> 8)
+                                            + (mw01 * y >> 8);
+                                vertex->y = mw13 + (y * mw11 >> 8) + (z * mw12 >> 8)
+                                            + (mw10 * x >> 8);
+                                vertex->z = mw23 + ((x * mw20) >> 8)
+                                            + ((mw22 * z >> 8) + (mw21 * y >> 8));
                                 vertex->color = color;
                             }
                         }
@@ -721,18 +795,18 @@ void RSDK::AddMeshFrameToScene(uint16 modelFrames, uint16 sceneIndex, Animator *
                                     i++;
 
                                     Scene3DVertex *vertex = &scn->vertices[vertID++];
-                                    vertex->x = matWorld->values[0][3] + (z * matWorld->values[0][2] >> 8) + (x * matWorld->values[0][0] >> 8)
-                                                + (y * matWorld->values[0][1] >> 8);
-                                    vertex->y = matWorld->values[1][3] + (y * matWorld->values[1][1] >> 8) + (matWorld->values[1][0] * x >> 8)
-                                                + (z * matWorld->values[1][2] >> 8);
-                                    vertex->z = matWorld->values[2][3] + (x * matWorld->values[2][0] >> 8) + (matWorld->values[2][2] * z >> 8)
-                                                + (matWorld->values[2][1] * y >> 8);
-                                    vertex->nx = (nz * matNormals->values[0][2] >> 8) + (nx * matNormals->values[0][0] >> 8)
-                                                 + (matNormals->values[0][1] * ny >> 8);
-                                    vertex->ny = (ny * matNormals->values[1][1] >> 8) + (nz * matNormals->values[1][2] >> 8)
-                                                 + (nx * matNormals->values[1][0] >> 8);
-                                    vertex->nz = ((ny * matNormals->values[2][1]) >> 8)
-                                                 + ((matNormals->values[2][0] * nx >> 8) + (nz * matNormals->values[2][2] >> 8));
+                                    vertex->x = mw03 + (z * mw02 >> 8) + (x * mw00 >> 8)
+                                                + (y * mw01 >> 8);
+                                    vertex->y = mw13 + (y * mw11 >> 8) + (mw10 * x >> 8)
+                                                + (z * mw12 >> 8);
+                                    vertex->z = mw23 + (x * mw20 >> 8) + (mw22 * z >> 8)
+                                                + (mw21 * y >> 8);
+                                    vertex->nx = (nz * mn02 >> 8) + (nx * mn00 >> 8)
+                                                 + (mn01 * ny >> 8);
+                                    vertex->ny = (ny * mn11 >> 8) + (nz * mn12 >> 8)
+                                                 + (nx * mn10 >> 8);
+                                    vertex->nz = ((ny * mn21) >> 8)
+                                                 + ((mn20 * nx >> 8) + (nz * mn22 >> 8));
                                     vertex->color = color;
                                 }
                             }
@@ -749,12 +823,12 @@ void RSDK::AddMeshFrameToScene(uint16 modelFrames, uint16 sceneIndex, Animator *
                                     int32 z                    = frameVert->z + ((interpolate * (nextFrameVert->z - frameVert->z)) >> 8);
                                     i++;
                                     Scene3DVertex *vertex = &scn->vertices[vertID++];
-                                    vertex->x = matWorld->values[0][3] + (z * matWorld->values[0][2] >> 8) + (matWorld->values[0][0] * x >> 8)
-                                                + (matWorld->values[0][1] * y >> 8);
-                                    vertex->y = matWorld->values[1][3] + (y * matWorld->values[1][1] >> 8) + (z * matWorld->values[1][2] >> 8)
-                                                + (matWorld->values[1][0] * x >> 8);
-                                    vertex->z = matWorld->values[2][3] + ((matWorld->values[2][2] * z) >> 8)
-                                                + ((matWorld->values[2][0] * x >> 8) + (matWorld->values[2][1] * y >> 8));
+                                    vertex->x = mw03 + (z * mw02 >> 8) + (mw00 * x >> 8)
+                                                + (mw01 * y >> 8);
+                                    vertex->y = mw13 + (y * mw11 >> 8) + (z * mw12 >> 8)
+                                                + (mw10 * x >> 8);
+                                    vertex->z = mw23 + ((mw22 * z) >> 8)
+                                                + ((mw20 * x >> 8) + (mw21 * y >> 8));
                                     vertex->color = color;
                                 }
                             }
@@ -778,18 +852,18 @@ void RSDK::AddMeshFrameToScene(uint16 modelFrames, uint16 sceneIndex, Animator *
 
                                     Color *modelColor     = &mdl->colors[indices[i++]];
                                     Scene3DVertex *vertex = &scn->vertices[vertID++];
-                                    vertex->x = matWorld->values[0][3] + (matWorld->values[0][2] * z >> 8) + (y * matWorld->values[0][1] >> 8)
-                                                + (matWorld->values[0][0] * x >> 8);
-                                    vertex->y = matWorld->values[1][3] + (matWorld->values[1][2] * z >> 8) + (y * matWorld->values[1][1] >> 8)
-                                                + (matWorld->values[1][0] * x >> 8);
-                                    vertex->z = matWorld->values[2][3] + (x * matWorld->values[2][0] >> 8) + (y * matWorld->values[2][1] >> 8)
-                                                + (matWorld->values[2][2] * z >> 8);
-                                    vertex->nx = (matNormals->values[0][0] * nx >> 8) + (ny * matNormals->values[0][1] >> 8)
-                                                 + (matNormals->values[0][2] * nz >> 8);
-                                    vertex->ny = (matNormals->values[1][0] * nx >> 8) + (ny * matNormals->values[1][1] >> 8)
-                                                 + (matNormals->values[1][2] * nz >> 8);
-                                    vertex->nz = ((matNormals->values[2][2] * nz) >> 8)
-                                                 + ((ny * matNormals->values[2][1] >> 8) + (matNormals->values[2][0] * nx >> 8));
+                                    vertex->x = mw03 + (mw02 * z >> 8) + (y * mw01 >> 8)
+                                                + (mw00 * x >> 8);
+                                    vertex->y = mw13 + (mw12 * z >> 8) + (y * mw11 >> 8)
+                                                + (mw10 * x >> 8);
+                                    vertex->z = mw23 + (x * mw20 >> 8) + (y * mw21 >> 8)
+                                                + (mw22 * z >> 8);
+                                    vertex->nx = (mn00 * nx >> 8) + (ny * mn01 >> 8)
+                                                 + (mn02 * nz >> 8);
+                                    vertex->ny = (mn10 * nx >> 8) + (ny * mn11 >> 8)
+                                                 + (mn12 * nz >> 8);
+                                    vertex->nz = ((mn22 * nz) >> 8)
+                                                 + ((ny * mn21 >> 8) + (mn20 * nx >> 8));
                                     vertex->color = modelColor->color;
                                 }
                             }
@@ -806,12 +880,12 @@ void RSDK::AddMeshFrameToScene(uint16 modelFrames, uint16 sceneIndex, Animator *
                                     int32 z                    = frameVert->z + ((interpolate * (nextFrameVert->z - frameVert->z)) >> 8);
                                     Color *modelColor          = &mdl->colors[indices[i++]];
                                     Scene3DVertex *vertex      = &scn->vertices[vertID++];
-                                    vertex->x = matWorld->values[0][3] + (matWorld->values[0][0] * x >> 8) + (y * matWorld->values[0][1] >> 8)
-                                                + (z * matWorld->values[0][2] >> 8);
-                                    vertex->y = matWorld->values[1][3] + (z * matWorld->values[1][2] >> 8) + (matWorld->values[1][0] * x >> 8)
-                                                + (y * matWorld->values[1][1] >> 8);
-                                    vertex->z = matWorld->values[2][3] + (matWorld->values[2][2] * z >> 8) + (y * matWorld->values[2][1] >> 8)
-                                                + (x * matWorld->values[2][0] >> 8);
+                                    vertex->x = mw03 + (mw00 * x >> 8) + (y * mw01 >> 8)
+                                                + (z * mw02 >> 8);
+                                    vertex->y = mw13 + (z * mw12 >> 8) + (mw10 * x >> 8)
+                                                + (y * mw11 >> 8);
+                                    vertex->z = mw23 + (mw22 * z >> 8) + (y * mw21 >> 8)
+                                                + (x * mw20 >> 8);
                                     vertex->color = modelColor->color;
                                 }
                             }
@@ -821,6 +895,7 @@ void RSDK::AddMeshFrameToScene(uint16 modelFrames, uint16 sceneIndex, Animator *
             }
         }
     }
+    S3D_TIME_END(gu_s3dMeshUsec);
 }
 
 void RSDK::Draw3DScene(uint16 sceneID)
@@ -828,6 +903,21 @@ void RSDK::Draw3DScene(uint16 sceneID)
     if (sceneID < SCENE3D_COUNT) {
         Entity *entity = sceneInfo.entity;
         Scene3D *scn   = &scene3DList[sceneID];
+
+        // Scene/screen constants hoisted out of the per-vertex loops below.
+        //
+        // Each draw mode reads these through the `scn` and `currentScreen`
+        // pointers inside loops that write to vertPos[]/vertClrs[]. The
+        // compiler cannot prove those writes don't alias the structs, so all
+        // of them were reloaded for EVERY vertex -- 13 dependent loads per
+        // vertex in the shaded modes, across thousands of vertices a frame.
+        const int32 s3dProjX = scn->projectionX, s3dProjY = scn->projectionY;
+        const int32 s3dDiffX = scn->diffuseX, s3dDiffY = scn->diffuseY, s3dDiffZ = scn->diffuseZ;
+        const int32 s3dDiffIX = scn->diffuseIntensityX, s3dDiffIY = scn->diffuseIntensityY, s3dDiffIZ = scn->diffuseIntensityZ;
+        const int32 s3dSpecIX = scn->specularIntensityX, s3dSpecIY = scn->specularIntensityY, s3dSpecIZ = scn->specularIntensityZ;
+        const int32 s3dCenterX = currentScreen->center.x, s3dCenterY = currentScreen->center.y;
+        const int32 s3dPosX = currentScreen->position.x, s3dPosY = currentScreen->position.y;
+
 
         // Setup face buffer.
         // Each face's depth is an average of the depth of its vertices.
@@ -873,26 +963,28 @@ void RSDK::Draw3DScene(uint16 sceneID)
             ++faceVertCounts;
         }
 
-        // Sort the face buffer. This is needed so that the faces don't overlap each other incorrectly when they're rendered.
-        // This is an insertion sort, taken from here:
-        // https://web.archive.org/web/20110108233032/http://rosettacode.org/wiki/Sorting_algorithms/Insertion_sort#C
+        // Sort the face buffer back-to-front, so faces don't overlap each other
+        // incorrectly when rendered.
+        //
+        // This was an insertion sort -- O(n^2). Measured on PSP hardware, the
+        // Special Stage spent 26-117ms per frame inside ProcessObjectDrawLists,
+        // dropping it to 6-16fps, and the quadratic growth is exactly why the
+        // cost swung so wildly with how much geometry was on screen.
+        //
+        // std::sort is O(n log n). It isn't stable, but it doesn't need to be
+        // here: `index` is the face's vertex offset, which increases
+        // monotonically with face order, so tie-breaking on it reproduces the
+        // insertion sort's ordering for equal depths exactly -- important
+        // because coplanar faces reordering frame to frame would shimmer.
+        S3D_TIME_BEGIN(gu_s3dSortUsec);
+        std::sort(scn->faceBuffer, scn->faceBuffer + scn->faceCount, [](const Scene3DFace &a, const Scene3DFace &b) {
+            if (a.depth != b.depth)
+                return a.depth > b.depth; // farthest first
+            return a.index < b.index;     // preserve original order within a depth
+        });
+        S3D_TIME_END(gu_s3dSortUsec);
 
-        Scene3DFace *a = scn->faceBuffer;
-
-        int i, j;
-        Scene3DFace temp;
-
-        for(i=1; i<scn->faceCount; i++)
-        {
-            temp = a[i];
-            j = i-1;
-            while(j>=0 && a[j].depth < temp.depth)
-            {
-                a[j+1] = a[j];
-                j -= 1;
-            }
-            a[j+1] = temp;
-        }
+        S3D_TIME_BEGIN(gu_s3dDrawUsec);
 
         // Finally, display the faces.
 
@@ -920,8 +1012,8 @@ void RSDK::Draw3DScene(uint16 sceneID)
                 for (int32 f = 0; f < scn->faceCount; ++f) {
                     Scene3DVertex *drawVert = &scn->vertices[scn->faceBuffer[f].index];
                     for (int32 v = 0; v < *vertCnt; ++v) {
-                        vertPos[v].x = (drawVert[v].x << 8) - (currentScreen->position.x << 16);
-                        vertPos[v].y = (drawVert[v].y << 8) - (currentScreen->position.y << 16);
+                        vertPos[v].x = (drawVert[v].x << 8) - (s3dPosX << 16);
+                        vertPos[v].y = (drawVert[v].y << 8) - (s3dPosY << 16);
                     }
                     DrawFace(vertPos, *vertCnt, (drawVert->color >> 16) & 0xFF, (drawVert->color >> 8) & 0xFF, (drawVert->color >> 0) & 0xFF,
                              entity->alpha, entity->inkEffect);
@@ -947,17 +1039,17 @@ void RSDK::Draw3DScene(uint16 sceneID)
                     int32 normal    = ny1 / vertCount;
                     int32 normalVal = (normal >> 2) * (abs(normal) >> 2);
 
-                    int32 specular = normalVal >> 6 >> scn->specularIntensityX;
+                    int32 specular = normalVal >> 6 >> s3dSpecIX;
                     specular       = CLAMP(specular, 0x00, 0xFF);
-                    int32 r = specular + ((int32)((drawVert->color >> 16) & 0xFF) * ((normal >> 10) + scn->diffuseX) >> scn->diffuseIntensityX);
+                    int32 r = specular + ((int32)((drawVert->color >> 16) & 0xFF) * ((normal >> 10) + s3dDiffX) >> s3dDiffIX);
 
-                    specular = normalVal >> 6 >> scn->specularIntensityY;
+                    specular = normalVal >> 6 >> s3dSpecIY;
                     specular = CLAMP(specular, 0x00, 0xFF);
-                    int32 g  = specular + ((int32)((drawVert->color >> 8) & 0xFF) * ((normal >> 10) + scn->diffuseY) >> scn->diffuseIntensityY);
+                    int32 g  = specular + ((int32)((drawVert->color >> 8) & 0xFF) * ((normal >> 10) + s3dDiffY) >> s3dDiffIY);
 
-                    specular = normalVal >> 6 >> scn->specularIntensityZ;
+                    specular = normalVal >> 6 >> s3dSpecIZ;
                     specular = CLAMP(specular, 0x00, 0xFF);
-                    int32 b  = specular + ((int32)((drawVert->color >> 0) & 0xFF) * ((normal >> 10) + scn->diffuseZ) >> scn->diffuseIntensityZ);
+                    int32 b  = specular + ((int32)((drawVert->color >> 0) & 0xFF) * ((normal >> 10) + s3dDiffZ) >> s3dDiffIZ);
 
                     r = CLAMP(r, 0x00, 0xFF);
                     g = CLAMP(g, 0x00, 0xFF);
@@ -984,24 +1076,24 @@ void RSDK::Draw3DScene(uint16 sceneID)
                     int32 ny = 0;
                     for (int32 v = 0; v < vertCount; ++v) {
                         ny += drawVert[v].ny;
-                        vertPos[v].x = (drawVert[v].x << 8) - (currentScreen->position.x << 16);
-                        vertPos[v].y = (drawVert[v].y << 8) - (currentScreen->position.y << 16);
+                        vertPos[v].x = (drawVert[v].x << 8) - (s3dPosX << 16);
+                        vertPos[v].y = (drawVert[v].y << 8) - (s3dPosY << 16);
                     }
 
                     int32 normal    = ny / vertCount;
                     int32 normalVal = (normal >> 2) * (abs(normal) >> 2);
 
-                    int32 specular = normalVal >> 6 >> scn->specularIntensityX;
+                    int32 specular = normalVal >> 6 >> s3dSpecIX;
                     specular       = CLAMP(specular, 0x00, 0xFF);
-                    int32 r = specular + ((int32)((drawVert->color >> 16) & 0xFF) * ((normal >> 10) + scn->diffuseX) >> scn->diffuseIntensityX);
+                    int32 r = specular + ((int32)((drawVert->color >> 16) & 0xFF) * ((normal >> 10) + s3dDiffX) >> s3dDiffIX);
 
-                    specular = normalVal >> 6 >> scn->specularIntensityY;
+                    specular = normalVal >> 6 >> s3dSpecIY;
                     specular = CLAMP(specular, 0x00, 0xFF);
-                    int32 g  = specular + ((int32)((drawVert->color >> 8) & 0xFF) * ((normal >> 10) + scn->diffuseY) >> scn->diffuseIntensityY);
+                    int32 g  = specular + ((int32)((drawVert->color >> 8) & 0xFF) * ((normal >> 10) + s3dDiffY) >> s3dDiffIY);
 
-                    specular = normalVal >> 6 >> scn->specularIntensityZ;
+                    specular = normalVal >> 6 >> s3dSpecIZ;
                     specular = CLAMP(specular, 0x00, 0xFF);
-                    int32 b  = specular + ((int32)((drawVert->color >> 0) & 0xFF) * ((normal >> 10) + scn->diffuseZ) >> scn->diffuseIntensityZ);
+                    int32 b  = specular + ((int32)((drawVert->color >> 0) & 0xFF) * ((normal >> 10) + s3dDiffZ) >> s3dDiffIZ);
 
                     r = CLAMP(r, 0x00, 0xFF);
                     g = CLAMP(g, 0x00, 0xFF);
@@ -1022,23 +1114,23 @@ void RSDK::Draw3DScene(uint16 sceneID)
                     int32 vertCount         = *vertCnt;
 
                     for (int32 v = 0; v < vertCount; ++v) {
-                        vertPos[v].x = (drawVert[v].x << 8) - (currentScreen->position.x << 16);
-                        vertPos[v].y = (drawVert[v].y << 8) - (currentScreen->position.y << 16);
+                        vertPos[v].x = (drawVert[v].x << 8) - (s3dPosX << 16);
+                        vertPos[v].y = (drawVert[v].y << 8) - (s3dPosY << 16);
 
                         int32 normal    = drawVert[v].ny;
                         int32 normalVal = (normal >> 2) * (abs(normal) >> 2);
 
-                        int32 specular = (normalVal >> 6) >> scn->specularIntensityX;
+                        int32 specular = (normalVal >> 6) >> s3dSpecIX;
                         specular       = CLAMP(specular, 0x00, 0xFF);
-                        int32 r = specular + ((int32)((drawVert->color >> 16) & 0xFF) * ((normal >> 10) + scn->diffuseX) >> scn->diffuseIntensityX);
+                        int32 r = specular + ((int32)((drawVert->color >> 16) & 0xFF) * ((normal >> 10) + s3dDiffX) >> s3dDiffIX);
 
-                        specular = (normalVal >> 6) >> scn->specularIntensityY;
+                        specular = (normalVal >> 6) >> s3dSpecIY;
                         specular = CLAMP(specular, 0x00, 0xFF);
-                        int32 g  = specular + ((int32)((drawVert->color >> 8) & 0xFF) * ((normal >> 10) + scn->diffuseY) >> scn->diffuseIntensityY);
+                        int32 g  = specular + ((int32)((drawVert->color >> 8) & 0xFF) * ((normal >> 10) + s3dDiffY) >> s3dDiffIY);
 
-                        specular = (normalVal >> 6) >> scn->specularIntensityZ;
+                        specular = (normalVal >> 6) >> s3dSpecIZ;
                         specular = CLAMP(specular, 0x00, 0xFF);
-                        int32 b  = specular + ((int32)((drawVert->color >> 0) & 0xFF) * ((normal >> 10) + scn->diffuseZ) >> scn->diffuseIntensityZ);
+                        int32 b  = specular + ((int32)((drawVert->color >> 0) & 0xFF) * ((normal >> 10) + s3dDiffZ) >> s3dDiffIZ);
 
                         r = CLAMP(r, 0x00, 0xFF);
                         g = CLAMP(g, 0x00, 0xFF);
@@ -1064,8 +1156,8 @@ void RSDK::Draw3DScene(uint16 sceneID)
                             v = 0xFF;
                         }
                         else {
-                            vertPos[v].x = currentScreen->center.x + (drawVert[v].x << scn->projectionX) / vertZ;
-                            vertPos[v].y = currentScreen->center.y - (drawVert[v].y << scn->projectionY) / vertZ;
+                            vertPos[v].x = s3dCenterX + (drawVert[v].x << s3dProjX) / vertZ;
+                            vertPos[v].y = s3dCenterY - (drawVert[v].y << s3dProjY) / vertZ;
                         }
                     }
 
@@ -1094,8 +1186,8 @@ void RSDK::Draw3DScene(uint16 sceneID)
                             v = 0xFF;
                         }
                         else {
-                            vertPos[v].x = (currentScreen->center.x << 16) + ((drawVert[v].x << scn->projectionX) / vertZ << 16);
-                            vertPos[v].y = (currentScreen->center.y << 16) - ((drawVert[v].y << scn->projectionY) / vertZ << 16);
+                            vertPos[v].x = (s3dCenterX << 16) + ((drawVert[v].x << s3dProjX) / vertZ << 16);
+                            vertPos[v].y = (s3dCenterY << 16) - ((drawVert[v].y << s3dProjY) / vertZ << 16);
                         }
                     }
 
@@ -1120,8 +1212,8 @@ void RSDK::Draw3DScene(uint16 sceneID)
                             v = 0xFF;
                         }
                         else {
-                            vertPos[v].x = currentScreen->center.x + (drawVert[v].x << scn->projectionX) / vertZ;
-                            vertPos[v].y = currentScreen->center.y - (drawVert[v].y << scn->projectionY) / vertZ;
+                            vertPos[v].x = s3dCenterX + (drawVert[v].x << s3dProjX) / vertZ;
+                            vertPos[v].y = s3dCenterY - (drawVert[v].y << s3dProjY) / vertZ;
                             ny1 += drawVert[v].ny;
                         }
                     }
@@ -1130,17 +1222,17 @@ void RSDK::Draw3DScene(uint16 sceneID)
                         int32 normal    = ny1 / vertCount;
                         int32 normalVal = (normal >> 2) * (abs(normal) >> 2);
 
-                        int32 specular = normalVal >> 6 >> scn->specularIntensityX;
+                        int32 specular = normalVal >> 6 >> s3dSpecIX;
                         specular       = CLAMP(specular, 0x00, 0xFF);
-                        int32 r = specular + ((int32)((drawVert[0].color >> 16) & 0xFF) * ((normal >> 10) + scn->diffuseX) >> scn->diffuseIntensityX);
+                        int32 r = specular + ((int32)((drawVert[0].color >> 16) & 0xFF) * ((normal >> 10) + s3dDiffX) >> s3dDiffIX);
 
-                        specular = normalVal >> 6 >> scn->specularIntensityY;
+                        specular = normalVal >> 6 >> s3dSpecIY;
                         specular = CLAMP(specular, 0x00, 0xFF);
-                        int32 g  = specular + ((int32)((drawVert[0].color >> 8) & 0xFF) * ((normal >> 10) + scn->diffuseY) >> scn->diffuseIntensityY);
+                        int32 g  = specular + ((int32)((drawVert[0].color >> 8) & 0xFF) * ((normal >> 10) + s3dDiffY) >> s3dDiffIY);
 
-                        specular = normalVal >> 6 >> scn->specularIntensityZ;
+                        specular = normalVal >> 6 >> s3dSpecIZ;
                         specular = CLAMP(specular, 0x00, 0xFF);
-                        int32 b  = specular + ((int32)((drawVert[0].color >> 0) & 0xFF) * ((normal >> 10) + scn->diffuseZ) >> scn->diffuseIntensityZ);
+                        int32 b  = specular + ((int32)((drawVert[0].color >> 0) & 0xFF) * ((normal >> 10) + s3dDiffZ) >> s3dDiffIZ);
 
                         r = CLAMP(r, 0x00, 0xFF);
                         g = CLAMP(g, 0x00, 0xFF);
@@ -1173,8 +1265,8 @@ void RSDK::Draw3DScene(uint16 sceneID)
                             v = 0xFF;
                         }
                         else {
-                            vertPos[v].x = (currentScreen->center.x << 16) + ((drawVert[v].x << scn->projectionX) / vertZ << 16);
-                            vertPos[v].y = (currentScreen->center.y << 16) - ((drawVert[v].y << scn->projectionY) / vertZ << 16);
+                            vertPos[v].x = (s3dCenterX << 16) + ((drawVert[v].x << s3dProjX) / vertZ << 16);
+                            vertPos[v].y = (s3dCenterY << 16) - ((drawVert[v].y << s3dProjY) / vertZ << 16);
                             ny += drawVert[v].ny;
                         }
                     }
@@ -1183,17 +1275,17 @@ void RSDK::Draw3DScene(uint16 sceneID)
                         int32 normal    = ny / vertCount;
                         int32 normalVal = (normal >> 2) * (abs(normal) >> 2);
 
-                        int32 specular = normalVal >> 6 >> scn->specularIntensityX;
+                        int32 specular = normalVal >> 6 >> s3dSpecIX;
                         specular       = CLAMP(specular, 0x00, 0xFF);
-                        int32 r = specular + ((int32)((drawVert[0].color >> 16) & 0xFF) * ((normal >> 10) + scn->diffuseX) >> scn->diffuseIntensityX);
+                        int32 r = specular + ((int32)((drawVert[0].color >> 16) & 0xFF) * ((normal >> 10) + s3dDiffX) >> s3dDiffIX);
 
-                        specular = normalVal >> 6 >> scn->specularIntensityY;
+                        specular = normalVal >> 6 >> s3dSpecIY;
                         specular = CLAMP(specular, 0x00, 0xFF);
-                        int32 g  = specular + ((int32)((drawVert[0].color >> 8) & 0xFF) * ((normal >> 10) + scn->diffuseY) >> scn->diffuseIntensityY);
+                        int32 g  = specular + ((int32)((drawVert[0].color >> 8) & 0xFF) * ((normal >> 10) + s3dDiffY) >> s3dDiffIY);
 
-                        specular = normalVal >> 6 >> scn->specularIntensityZ;
+                        specular = normalVal >> 6 >> s3dSpecIZ;
                         specular = CLAMP(specular, 0x00, 0xFF);
-                        int32 b  = specular + ((int32)((drawVert[0].color >> 0) & 0xFF) * ((normal >> 10) + scn->diffuseZ) >> scn->diffuseIntensityZ);
+                        int32 b  = specular + ((int32)((drawVert[0].color >> 0) & 0xFF) * ((normal >> 10) + s3dDiffZ) >> s3dDiffIZ);
 
                         r = CLAMP(r, 0x00, 0xFF);
                         g = CLAMP(g, 0x00, 0xFF);
@@ -1221,26 +1313,26 @@ void RSDK::Draw3DScene(uint16 sceneID)
                             v = 0xFF;
                         }
                         else {
-                            vertPos[v].x = (currentScreen->center.x << 16) + ((drawVert[v].x << scn->projectionX) / vertZ << 16);
-                            vertPos[v].y = (currentScreen->center.y << 16) - ((drawVert[v].y << scn->projectionY) / vertZ << 16);
+                            vertPos[v].x = (s3dCenterX << 16) + ((drawVert[v].x << s3dProjX) / vertZ << 16);
+                            vertPos[v].y = (s3dCenterY << 16) - ((drawVert[v].y << s3dProjY) / vertZ << 16);
 
                             int32 normal    = drawVert[v].ny;
                             int32 normalVal = (normal >> 2) * (abs(normal) >> 2);
 
-                            int32 specular = normalVal >> 6 >> scn->specularIntensityX;
+                            int32 specular = normalVal >> 6 >> s3dSpecIX;
                             specular       = CLAMP(specular, 0x00, 0xFF);
                             int32 r =
-                                specular + ((int32)((drawVert[v].color >> 16) & 0xFF) * ((normal >> 10) + scn->diffuseX) >> scn->diffuseIntensityX);
+                                specular + ((int32)((drawVert[v].color >> 16) & 0xFF) * ((normal >> 10) + s3dDiffX) >> s3dDiffIX);
 
-                            specular = normalVal >> 6 >> scn->specularIntensityY;
+                            specular = normalVal >> 6 >> s3dSpecIY;
                             specular = CLAMP(specular, 0x00, 0xFF);
                             int32 g =
-                                specular + ((int32)((drawVert[v].color >> 8) & 0xFF) * ((normal >> 10) + scn->diffuseY) >> scn->diffuseIntensityY);
+                                specular + ((int32)((drawVert[v].color >> 8) & 0xFF) * ((normal >> 10) + s3dDiffY) >> s3dDiffIY);
 
-                            specular = normalVal >> 6 >> scn->specularIntensityZ;
+                            specular = normalVal >> 6 >> s3dSpecIZ;
                             specular = CLAMP(specular, 0x00, 0xFF);
                             int32 b =
-                                specular + ((int32)((drawVert[v].color >> 0) & 0xFF) * ((normal >> 10) + scn->diffuseZ) >> scn->diffuseIntensityZ);
+                                specular + ((int32)((drawVert[v].color >> 0) & 0xFF) * ((normal >> 10) + s3dDiffZ) >> s3dDiffIZ);
 
                             r = CLAMP(r, 0x00, 0xFF);
                             g = CLAMP(g, 0x00, 0xFF);
@@ -1259,5 +1351,6 @@ void RSDK::Draw3DScene(uint16 sceneID)
                 }
                 break;
         }
+        S3D_TIME_END(gu_s3dDrawUsec);
     }
 }

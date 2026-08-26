@@ -36,8 +36,17 @@ else()
 endif()
 endif()
 
-target_compile_options(RetroEngine PRIVATE -O3 -fpermissive)
-target_compile_options(${GAME_NAME} PRIVATE -O3 -fpermissive) 
+target_compile_options(RetroEngine PRIVATE -O3 -fpermissive -g)
+target_compile_options(${GAME_NAME} PRIVATE -O3 -fpermissive -g)
+
+# create_pbp_file (below) strips the ELF in place, which leaves nothing for
+# psp-addr2line to resolve a crash PC against. Stash an unstripped copy first
+# -- POST_BUILD commands run in the order they're added, so this lands before
+# the strip. -g costs nothing at runtime; it only adds debug sections that the
+# strip removes from the shipped binary anyway.
+add_custom_command(TARGET RetroEngine POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E copy $<TARGET_FILE:RetroEngine> $<TARGET_FILE:RetroEngine>.sym
+    COMMENT "Saving unstripped ELF for crash symbolication")
 
 
 
@@ -48,10 +57,16 @@ target_compile_definitions(RetroEngine PRIVATE ${SHARED_DEFINES})
 target_compile_definitions(${GAME_NAME} PRIVATE ${SHARED_DEFINES})
 target_compile_definitions(RetroEngine PRIVATE RETRO_DISABLE_LOG=1)
 
-target_link_libraries(RetroEngine pspdebug pspfpu pspgu pspdisplay pspge pspctrl m)
+target_compile_definitions(RetroEngine PRIVATE RETRO_AUDIODEVICE_PSP=1)
+
+# pspdmac: sceDmacMemcpy, used to move the finished frame from the
+# rasterizer's main-RAM surface into VRAM (see CopyFrameBuffer).
+target_link_libraries(RetroEngine pspdebug pspfpu pspgu pspdisplay pspge pspctrl pspaudiolib pspaudio psppower pspdmac m)
 
 set(PLATFORM PSP)
 create_pbp_file(TARGET RetroEngine
 	TITLE "${CMAKE_PROJECT_NAME}"
     ICON_PATH ../../../${RSDK_PATH}/psp/ICON0.png
-    BACKGROUND_PATH ../../../${RSDK_PATH}/psp/PIC1.png)
+    BACKGROUND_PATH ../../../${RSDK_PATH}/psp/PIC1.png
+    MUSIC_PATH ../../../${RSDK_PATH}/psp/SND0.at3
+    MEMSIZE 1)

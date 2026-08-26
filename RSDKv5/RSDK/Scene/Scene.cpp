@@ -691,12 +691,14 @@ void RSDK::LoadSceneAssets()
             entity++;
         }
 
-        for (int32 i = 0; i < SCENEENTITY_COUNT; ++i) {
-            if (sceneInfo.filter & tempEntityList[i].filter)
-                memcpy(&objectEntityList[activeSlot++], &tempEntityList[i], sizeof(EntityBase));
+        if (tempEntityList) {
+            for (int32 i = 0; i < SCENEENTITY_COUNT; ++i) {
+                if (sceneInfo.filter & tempEntityList[i].filter)
+                    memcpy(&objectEntityList[activeSlot++], &tempEntityList[i], sizeof(EntityBase));
 
-            if (activeSlot >= SCENEENTITY_COUNT + RESERVE_ENTITY_COUNT)
-                break;
+                if (activeSlot >= SCENEENTITY_COUNT + RESERVE_ENTITY_COUNT)
+                    break;
+            }
         }
 
 #if !RETRO_USE_ORIGINAL_CODE
@@ -1296,12 +1298,22 @@ void RSDK::DrawLayerHScroll(TileLayer *layer)
     if (!layer->xsize || !layer->ysize)
         return;
 
+    // BISECT: back to pitch, as originally. Narrowing this to size.x was done
+    // for the 1:1 presentation experiment (where the row padding became the
+    // visible border); with the fullscreen blit restored the padding is
+    // off-screen again and this no longer needs to change.
     int32 lineTileCount    = (currentScreen->pitch >> 4) - 1;
     uint8 *lineBuffer      = &gfxLineBuffer[currentScreen->clipBound_Y1];
     ScanlineInfo *scanline = &scanlines[currentScreen->clipBound_Y1];
     uint16 *frameBuffer    = &currentScreen->frameBuffer[currentScreen->pitch * currentScreen->clipBound_Y1];
 
     for (int32 cy = currentScreen->clipBound_Y1; cy < currentScreen->clipBound_Y2; ++cy) {
+        // This loop has no explicit "step to the next row": it relied on the
+        // per-tile advances summing to exactly one stride, which only held
+        // while the drawn width WAS the stride. Now that it draws size.x
+        // rather than pitch, the row start is anchored explicitly instead --
+        // which is robust however the inner loops advance.
+        uint16 *rowStart      = frameBuffer;
         int32 x               = scanline->position.x;
         int32 y               = scanline->position.y;
         int32 tileX           = FROM_FIXED(x);
@@ -1315,7 +1327,7 @@ void RSDK::DrawLayerHScroll(TileLayer *layer)
         int32 tileRemain = TILE_SIZE - (FROM_FIXED(x) & 0xF);
         int32 sheetX     = FROM_FIXED(x) & 0xF;
         int32 sheetY     = TILE_SIZE * (FROM_FIXED(y) & 0xF);
-        int32 lineRemain = currentScreen->pitch;
+        int32 lineRemain = currentScreen->pitch; // BISECT: see lineTileCount above
 
         int32 tx       = x >> 20;
         uint16 *layout = &layer->layout[tx + ((y >> 20) << layer->widthShift)];
@@ -1343,13 +1355,39 @@ void RSDK::DrawLayerHScroll(TileLayer *layer)
             }
 
             if (*layout < 0xFFFF) {
-                uint8 *pixels = &tilesetPixels[TILE_DATASIZE * (*layout & 0xFFF) + sheetY];
+                // Whole-tile span (16px), the hot path -- tile layers measure
+                // ~9.9ms/frame in GHZ1 gameplay, the largest single rendering
+                // cost by far, and almost all of it lands here.
+                //
+                // Read four palette indices per 32-bit load instead of
+                // sixteen byte loads. A tile row always starts at
+                // TILE_DATASIZE*id + TILE_SIZE*row, both multiples of 16, so
+                // this is safely aligned. The `!quad` test also skips four
+                // fully-transparent pixels at once, which is the common case
+                // in the sparse background layers.
+                const uint32 *pixels32 = (const uint32 *)&tilesetPixels[TILE_DATASIZE * (*layout & 0xFFF) + sheetY];
 
-                uint8 index = *pixels;
-                for(uint8 ppx = 0;ppx<16;ppx++){
-                    index = pixels[ppx];
-                    if (index)
-                        frameBuffer[ppx] = activePalette[index];
+                for (int32 g = 0; g < 4; ++g) {
+                    uint32 quad = pixels32[g];
+                    if (!quad)
+                        continue;
+
+                    uint16 *fb = &frameBuffer[g * 4];
+                    // Little-endian: the lowest address is the low byte, so
+                    // index 0 is the leftmost pixel of the group.
+                    uint32 i0 = quad & 0xFF;
+                    uint32 i1 = (quad >> 8) & 0xFF;
+                    uint32 i2 = (quad >> 16) & 0xFF;
+                    uint32 i3 = quad >> 24;
+
+                    if (i0)
+                        fb[0] = activePalette[i0];
+                    if (i1)
+                        fb[1] = activePalette[i1];
+                    if (i2)
+                        fb[2] = activePalette[i2];
+                    if (i3)
+                        fb[3] = activePalette[i3];
                 }
             }
 
@@ -1383,6 +1421,7 @@ void RSDK::DrawLayerHScroll(TileLayer *layer)
             lineRemain -= TILE_SIZE;
         }
 
+        frameBuffer = rowStart + currentScreen->pitch;
         ++scanline;
     }
 }
@@ -1442,9 +1481,15 @@ void RSDK::DrawLayerVScroll(TileLayer *layer)
             else {
                 uint8 *pixels = &tilesetPixels[TILE_DATASIZE * (*layout & 0xFFF) + sheetX];
 
-                for(uint8 ppx = 0;ppx<16;ppx++){
-                    if (pixels[(ppx<<4)])
-                        frameBuffer[currentScreen->pitch * ppx] = activePalette[pixels[(ppx<<4)]];
+                // currentScreen->pitch hoisted: the store through frameBuffer
+                // could alias currentScreen, so it was reloaded every pixel.
+                {
+                    const int32 fbPitch = currentScreen->pitch;
+                    for (uint8 ppx = 0; ppx < 16; ppx++) {
+                        const uint8 idx = pixels[(ppx << 4)];
+                        if (idx)
+                            frameBuffer[fbPitch * ppx] = activePalette[idx];
+                    }
                 }
 
                 frameBuffer += currentScreen->pitch * TILE_SIZE;
@@ -1499,6 +1544,14 @@ void RSDK::DrawLayerRotozoom(TileLayer *layer)
     int32 height   = (TILE_SIZE << layer->heightShift) - 1;
     int32 lineSize = currentScreen->clipBound_X2 - currentScreen->clipBound_X1;
 
+    // Hoisted out of the per-pixel loop below. That loop writes through
+    // `frameBuffer`, which the compiler cannot prove doesn't alias `layer`,
+    // so layer->widthShift was reloaded for EVERY pixel -- and this is a
+    // full-screen per-pixel loop, so that's ~100k redundant loads a frame.
+    const int32 widthShift = layer->widthShift;
+    const int32 tileMaskX  = width >> 4;
+    const int32 tileMaskY  = height >> 4;
+
     for (int32 cy = currentScreen->clipBound_Y1; cy < currentScreen->clipBound_Y2; ++cy) {
         int32 posX = scanline->position.x;
         int32 posY = scanline->position.y;
@@ -1507,20 +1560,27 @@ void RSDK::DrawLayerRotozoom(TileLayer *layer)
         ++lineBuffer;
         int32 fbOffset = currentScreen->pitch - lineSize;
 
+        // Same reasoning as widthShift above: the per-pixel store through
+        // frameBuffer could alias `scanline`, so both deform values were
+        // being reloaded for every pixel even though they're constant across
+        // the row.
+        const int32 deformX = scanline->deform.x;
+        const int32 deformY = scanline->deform.y;
+
         for (int32 cx = 0; cx < lineSize; ++cx) {
             int32 tx = posX >> 20;
             int32 ty = posY >> 20;
             int32 x  = FROM_FIXED(posX) & 0xF;
             int32 y  = FROM_FIXED(posY) & 0xF;
 
-            uint16 tile = layout[((width >> 4) & tx) + (((height >> 4) & ty) << layer->widthShift)] & 0xFFF;
+            uint16 tile = layout[(tileMaskX & tx) + ((tileMaskY & ty) << widthShift)] & 0xFFF;
             uint8 idx   = tilesetPixels[TILE_SIZE * (y + TILE_SIZE * tile) + x];
 
             if (idx)
                 *frameBuffer = activePalette[idx];
 
-            posX += scanline->deform.x;
-            posY += scanline->deform.y;
+            posX += deformX;
+            posY += deformY;
             ++frameBuffer;
         }
 
@@ -1590,10 +1650,45 @@ void RSDK::DrawLayerBasic(TileLayer *layer)
                     for (int32 y = 0; y < tileRemainY; ++y) {
                         uint8 index = *pixels;
 
-                        for(uint8 ppx = 0;ppx<16;ppx++){
-                            index = pixels[ppx];
-                            if (index)
-                                frameBuffer[ppx] = activePalette[index];
+                        // See the matching loop in DrawLayerHScroll: four
+                        // indices per 32-bit load instead of sixteen byte
+                        // loads, with a fast skip for four transparent
+                        // pixels at once. Tile rows are 16-byte aligned.
+                        {
+                            const uint32 *pixels32 = (const uint32 *)pixels;
+                            for (int32 g = 0; g < 4; ++g) {
+                                uint32 quad = pixels32[g];
+                                if (!quad)
+                                    continue;
+
+                                uint16 *fb = &frameBuffer[g * 4];
+                                uint32 i0 = quad & 0xFF;
+                                uint32 i1 = (quad >> 8) & 0xFF;
+                                uint32 i2 = (quad >> 16) & 0xFF;
+                                uint32 i3 = quad >> 24;
+
+                                // Fully-opaque groups -- by far the common
+                                // case inside solid tiles -- take one test
+                                // instead of four. The standard has-a-zero-
+                                // byte trick: (v - 0x01010101) & ~v &
+                                // 0x80808080 is non-zero iff some byte is 0.
+                                if (!((quad - 0x01010101u) & ~quad & 0x80808080u)) {
+                                    fb[0] = activePalette[i0];
+                                    fb[1] = activePalette[i1];
+                                    fb[2] = activePalette[i2];
+                                    fb[3] = activePalette[i3];
+                                }
+                                else {
+                                    if (i0)
+                                        fb[0] = activePalette[i0];
+                                    if (i1)
+                                        fb[1] = activePalette[i1];
+                                    if (i2)
+                                        fb[2] = activePalette[i2];
+                                    if (i3)
+                                        fb[3] = activePalette[i3];
+                                }
+                            }
                         }
 
                         frameBuffer += currentScreen->pitch;
@@ -1681,10 +1776,45 @@ void RSDK::DrawLayerBasic(TileLayer *layer)
 
                     for (int32 y = 0; y < TILE_SIZE; ++y) {
                         uint8 index = *pixels;
-                        for(uint8 ppx = 0;ppx<16;ppx++){
-                            index = pixels[ppx];
-                            if (index)
-                                frameBuffer[ppx] = activePalette[index];
+                        // See the matching loop in DrawLayerHScroll: four
+                        // indices per 32-bit load instead of sixteen byte
+                        // loads, with a fast skip for four transparent
+                        // pixels at once. Tile rows are 16-byte aligned.
+                        {
+                            const uint32 *pixels32 = (const uint32 *)pixels;
+                            for (int32 g = 0; g < 4; ++g) {
+                                uint32 quad = pixels32[g];
+                                if (!quad)
+                                    continue;
+
+                                uint16 *fb = &frameBuffer[g * 4];
+                                uint32 i0 = quad & 0xFF;
+                                uint32 i1 = (quad >> 8) & 0xFF;
+                                uint32 i2 = (quad >> 16) & 0xFF;
+                                uint32 i3 = quad >> 24;
+
+                                // Fully-opaque groups -- by far the common
+                                // case inside solid tiles -- take one test
+                                // instead of four. The standard has-a-zero-
+                                // byte trick: (v - 0x01010101) & ~v &
+                                // 0x80808080 is non-zero iff some byte is 0.
+                                if (!((quad - 0x01010101u) & ~quad & 0x80808080u)) {
+                                    fb[0] = activePalette[i0];
+                                    fb[1] = activePalette[i1];
+                                    fb[2] = activePalette[i2];
+                                    fb[3] = activePalette[i3];
+                                }
+                                else {
+                                    if (i0)
+                                        fb[0] = activePalette[i0];
+                                    if (i1)
+                                        fb[1] = activePalette[i1];
+                                    if (i2)
+                                        fb[2] = activePalette[i2];
+                                    if (i3)
+                                        fb[3] = activePalette[i3];
+                                }
+                            }
                         }
 
                         pixels += TILE_SIZE;
@@ -1775,10 +1905,45 @@ void RSDK::DrawLayerBasic(TileLayer *layer)
                     uint8 *pixels = &tilesetPixels[TILE_DATASIZE * (*layout & 0xFFF)];
                     for (int32 y = 0; y < sheetY; ++y) {
                         uint8 index = *pixels;
-                        for(uint8 ppx = 0;ppx<16;ppx++){
-                            index = pixels[ppx];
-                            if (index)
-                                frameBuffer[ppx] = activePalette[index];
+                        // See the matching loop in DrawLayerHScroll: four
+                        // indices per 32-bit load instead of sixteen byte
+                        // loads, with a fast skip for four transparent
+                        // pixels at once. Tile rows are 16-byte aligned.
+                        {
+                            const uint32 *pixels32 = (const uint32 *)pixels;
+                            for (int32 g = 0; g < 4; ++g) {
+                                uint32 quad = pixels32[g];
+                                if (!quad)
+                                    continue;
+
+                                uint16 *fb = &frameBuffer[g * 4];
+                                uint32 i0 = quad & 0xFF;
+                                uint32 i1 = (quad >> 8) & 0xFF;
+                                uint32 i2 = (quad >> 16) & 0xFF;
+                                uint32 i3 = quad >> 24;
+
+                                // Fully-opaque groups -- by far the common
+                                // case inside solid tiles -- take one test
+                                // instead of four. The standard has-a-zero-
+                                // byte trick: (v - 0x01010101) & ~v &
+                                // 0x80808080 is non-zero iff some byte is 0.
+                                if (!((quad - 0x01010101u) & ~quad & 0x80808080u)) {
+                                    fb[0] = activePalette[i0];
+                                    fb[1] = activePalette[i1];
+                                    fb[2] = activePalette[i2];
+                                    fb[3] = activePalette[i3];
+                                }
+                                else {
+                                    if (i0)
+                                        fb[0] = activePalette[i0];
+                                    if (i1)
+                                        fb[1] = activePalette[i1];
+                                    if (i2)
+                                        fb[2] = activePalette[i2];
+                                    if (i3)
+                                        fb[3] = activePalette[i3];
+                                }
+                            }
                         }
 
                         pixels += TILE_SIZE;

@@ -375,20 +375,73 @@ inline void SetDrawGroupProperties(uint8 drawGroup, bool32 sorted, void (*hookCB
 void SwapDrawListEntries(uint8 drawGroup, uint16 slot1, uint16 slot2, uint16 count);
 
 void FillScreen(uint32 color, int32 alphaR, int32 alphaG, int32 alphaB);
+#if RETRO_RENDERDEVICE_GU
+// PSP only: the actual per-pixel blend, split out of FillScreen so it can
+// be replayed later from the GU draw queue in correct relative order
+// against sprite/layer draws -- FillScreen is how full-screen fades work
+// (title/logo transitions, pause dimming), and if it ran immediately while
+// sprites around it were deferred, the fade would miss whatever hadn't
+// been drawn yet. See GU_QueueFillScreen() in GU/GURenderDevice.cpp.
+void FillScreen_CPU(uint32 color, int32 alphaR, int32 alphaG, int32 alphaB);
+#endif
 
 void DrawLine(int32 x1, int32 y1, int32 x2, int32 y2, uint32 color, int32 alpha, int32 inkEffect, bool32 screenRelative);
 void DrawRectangle(int32 x, int32 y, int32 width, int32 height, uint32 color, int32 alpha, int32 inkEffect, bool32 screenRelative);
+#if RETRO_RENDERDEVICE_GU
+// PSP only: the actual CPU rasterizer, split out of DrawRectangle so it can
+// be replayed later from the GU draw queue in correct relative order
+// against sprite/layer/fillscreen draws. See GU_QueueRectDraw() in
+// GU/GURenderDevice.cpp.
+void DrawRectangle_CPU(int32 x, int32 y, int32 width, int32 height, uint32 color, int32 alpha, int32 inkEffect);
+#endif
 void DrawCircle(int32 x, int32 y, int32 radius, uint32 color, int32 alpha, int32 inkEffect, bool32 screenRelative);
+#if RETRO_RENDERDEVICE_GU
+// PSP only: see DrawFace_CPU -- same split reasoning (circular iris-wipe
+// transitions are drawn via this).
+void DrawCircle_CPU(int32 x, int32 y, int32 radius, uint32 color, int32 alpha, int32 inkEffect);
+#endif
 void DrawCircleOutline(int32 x, int32 y, int32 innerRadius, int32 outerRadius, uint32 color, int32 alpha, int32 inkEffect, bool32 screenRelative);
+#if RETRO_RENDERDEVICE_GU
+void DrawCircleOutline_CPU(int32 x, int32 y, int32 innerRadius, int32 outerRadius, uint32 color, int32 alpha, int32 inkEffect);
+#endif
 
 void DrawFace(Vector2 *vertices, int32 vertCount, int32 r, int32 g, int32 b, int32 alpha, int32 inkEffect);
+#if RETRO_RENDERDEVICE_GU
+// PSP only: the actual rasterizer, split out of DrawFace so it can be
+// replayed later from the GU draw queue in correct relative order against
+// sprite/layer/fillscreen/rect/rotozoom draws. See GU_QueueFaceDraw() in
+// GU/GURenderDevice.cpp.
+void DrawFace_CPU(Vector2 *vertices, int32 vertCount, int32 r, int32 g, int32 b, int32 alpha, int32 inkEffect);
+#endif
 void DrawBlendedFace(Vector2 *vertices, uint32 *colors, int32 vertCount, int32 alpha, int32 inkEffect);
+#if RETRO_RENDERDEVICE_GU
+// PSP only: see DrawFace_CPU above.
+void DrawBlendedFace_CPU(Vector2 *vertices, uint32 *colors, int32 vertCount, int32 alpha, int32 inkEffect);
+#endif
 
 void DrawSprite(Animator *animator, Vector2 *position, bool32 screenRelative);
 void DrawSpriteFlipped(int32 x, int32 y, int32 width, int32 height, int32 sprX, int32 sprY, int32 direction, int32 inkEffect, int32 alpha,
                        int32 sheetID);
+#if RETRO_RENDERDEVICE_GU
+// PSP only: the actual CPU rasterizer, split out of DrawSpriteFlipped so it
+// can be called immediately (non-eligible sprites) or replayed later from
+// the GU draw queue (see GU/GURenderDevice.cpp) without duplicating the
+// per-pixel blit code. Takes the already-clipped coordinates plus the
+// pre-clip widthFlip/heightFlip the FLIP_X/FLIP_Y/FLIP_XY paths need.
+void DrawSpriteFlipped_CPU(int32 x, int32 y, int32 width, int32 height, int32 sprX, int32 sprY, int32 widthFlip, int32 heightFlip, int32 direction,
+                            int32 inkEffect, int32 alpha, int32 sheetID);
+#endif
 void DrawSpriteRotozoom(int32 x, int32 y, int32 pivotX, int32 pivotY, int32 width, int32 height, int32 sprX, int32 sprY, int32 scaleX, int32 scaleY,
                         int32 direction, int16 Rotation, int32 inkEffect, int32 alpha, int32 sheetID);
+#if RETRO_RENDERDEVICE_GU
+// PSP only: the actual CPU rasterizer, split out of DrawSpriteRotozoom so it
+// can be replayed later from the GU draw queue in correct relative order
+// against sprite/layer/fillscreen/rect draws. Takes the already-computed
+// clip rect and per-row/per-pixel transform deltas -- see
+// GU_QueueRotozoomDraw() in GU/GURenderDevice.cpp.
+void DrawSpriteRotozoom_CPU(int32 left, int32 top, int32 xSize, int32 ySize, int32 fullX, int32 fullY, int32 fullSprX, int32 fullSprY, int32 deltaX,
+                             int32 deltaY, int32 deltaXLen, int32 deltaYLen, int32 drawX, int32 drawY, int32 inkEffect, int32 alpha, int32 sheetID);
+#endif
 
 void DrawDeformedSprite(uint16 sheetID, int32 inkEffect, int32 alpha);
 
@@ -409,6 +462,10 @@ void DrawString(Animator *animator, Vector2 *position, String *string, int32 end
                 Vector2 *charPositions, bool32 screenRelative);
 void DrawDevString(const char *string, int32 x, int32 y, int32 align, uint32 color);
 
+#if RETRO_RENDERDEVICE_GU
+void GU_ClearSpriteTextures();
+#endif
+
 inline void ClearGfxSurfaces()
 {
     // Unload sprite sheets
@@ -418,6 +475,13 @@ inline void ClearGfxSurfaces()
             gfxSurface[s].scope = SCOPE_NONE;
         }
     }
+#if RETRO_RENDERDEVICE_GU
+    // Reclaim the VRAM sprite-texture arena -- it's a bump allocator with no
+    // per-sheet free, so it has to be reset wholesale here (same lifetime as
+    // the sprite sheets themselves) or it would fill up permanently over a
+    // long play session.
+    GU_ClearSpriteTextures();
+#endif
 }
 
 #if RETRO_REV0U

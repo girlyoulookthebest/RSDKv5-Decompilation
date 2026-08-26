@@ -342,8 +342,32 @@ void RSDK::InitObjects()
     if (!cameraCount)
         AddCamera(&screens[0].position, TO_FIXED(screens[0].center.x), TO_FIXED(screens[0].center.y), false);
 }
+#if RETRO_RENDERDEVICE_GU
+// Splits the frame's non-rendering time (measured at ~12ms in GHZ1 gameplay,
+// half of all compute) into entity updates vs. draw-list traversal. Both are
+// wrapped at the function level so every call site is covered.
+#include <psputils.h>
+SceUInt64 gu_objUpdateUsecAccum   = 0;
+SceUInt64 gu_objDrawListUsecAccum = 0;
+#endif
+
+// ProcessObjects used to walk all ENTITY_COUNT (2368) slots three separate
+// times per frame. The second and third passes only ever act on entities the
+// first pass already marked inRange, so for a scene using a small fraction of
+// those slots the other two passes were almost entirely cache misses on dead
+// entries -- ~2368 lines pulled in per pass, twice, for nothing.
+//
+// The first pass now records which slots came out inRange, and the other two
+// iterate that list instead. Measured at ~4.3-5.5ms/frame in GHZ1 gameplay,
+// this was the second largest item in the frame after tile layers.
+static uint16 inRangeEntities[ENTITY_COUNT];
+static int32 inRangeEntityCount = 0;
+
 void RSDK::ProcessObjects()
 {
+#if RETRO_RENDERDEVICE_GU
+    const SceUInt64 gu_objStart = sceKernelGetSystemTimeWide();
+#endif
     for (int32 i = 0; i < DRAWGROUP_COUNT; ++i) drawGroups[i].entityCount = 0;
 
     for (int32 o = 0; o < sceneInfo.classCount; ++o) {
@@ -378,6 +402,7 @@ void RSDK::ProcessObjects()
     }
 
     sceneInfo.entitySlot = 0;
+    inRangeEntityCount   = 0;
     for (int32 e = 0; e < ENTITY_COUNT; ++e) {
         sceneInfo.entity = &objectEntityList[e];
         if (sceneInfo.entity->classID) {
@@ -448,15 +473,25 @@ void RSDK::ProcessObjects()
             }
 
             if (sceneInfo.entity->inRange) {
+                inRangeEntities[inRangeEntityCount++] = (uint16)e;
+
                 if (objectClassList[stageObjectIDs[sceneInfo.entity->classID]].update)
                     objectClassList[stageObjectIDs[sceneInfo.entity->classID]].update();
 
                 if (sceneInfo.entity->drawGroup < DRAWGROUP_COUNT)
                     drawGroups[sceneInfo.entity->drawGroup].entries[drawGroups[sceneInfo.entity->drawGroup].entityCount++] = sceneInfo.entitySlot;
             }
+            else {
+                // The onScreen reset below used to happen in a full sweep over
+                // every slot. Now that the sweep only covers inRange entities,
+                // anything dropping OUT of range has to be cleared here or it
+                // would keep last frame's value indefinitely.
+                sceneInfo.entity->onScreen = 0;
+            }
         }
         else {
-            sceneInfo.entity->inRange = false;
+            sceneInfo.entity->inRange  = false;
+            sceneInfo.entity->onScreen = 0;
         }
 
         sceneInfo.entitySlot++;
@@ -468,9 +503,19 @@ void RSDK::ProcessObjects()
 
     for (int32 i = 0; i < TYPEGROUP_COUNT; ++i) typeGroups[i].entryCount = 0;
 
-    sceneInfo.entitySlot = 0;
-    for (int32 e = 0; e < ENTITY_COUNT; ++e) {
-        sceneInfo.entity = &objectEntityList[e];
+    // Walk the candidate list the pass above built rather than every slot.
+    //
+    // The inRange re-check is NOT redundant: the list records which entities
+    // were inRange at the time pass one visited them, but the update()
+    // callbacks it invokes can destroy entities or drop them out of range
+    // afterwards. The original code re-read inRange here for exactly that
+    // reason. Skipping the check let a destroyed entity reach
+    // typeGroups[classID] with a stale classID -- an out-of-bounds write that
+    // corrupted memory and crashed later with a wild read.
+    for (int32 i = 0; i < inRangeEntityCount; ++i) {
+        const int32 e        = inRangeEntities[i];
+        sceneInfo.entity     = &objectEntityList[e];
+        sceneInfo.entitySlot = e;
 
         if (sceneInfo.entity->inRange && sceneInfo.entity->interaction) {
             typeGroups[GROUP_ALL].entries[typeGroups[GROUP_ALL].entryCount++] = e; // All active objects
@@ -480,25 +525,30 @@ void RSDK::ProcessObjects()
             if (sceneInfo.entity->group >= TYPE_COUNT)
                 typeGroups[sceneInfo.entity->group].entries[typeGroups[sceneInfo.entity->group].entryCount++] = e; // extra groups
         }
-
-        sceneInfo.entitySlot++;
     }
 
-    sceneInfo.entitySlot = 0;
-    for (int32 e = 0; e < ENTITY_COUNT; ++e) {
-        sceneInfo.entity = &objectEntityList[e];
+    // Likewise: lateUpdate only ran for inRange entities. onScreen is reset
+    // here for those, and in the first pass for everything that isn't
+    // inRange, so every entity still gets cleared exactly once per frame.
+    for (int32 i = 0; i < inRangeEntityCount; ++i) {
+        const int32 e        = inRangeEntities[i];
+        sceneInfo.entity     = &objectEntityList[e];
+        sceneInfo.entitySlot = e;
 
+        // Re-checked for the same reason as the pass above.
         if (sceneInfo.entity->inRange) {
             if (objectClassList[stageObjectIDs[sceneInfo.entity->classID]].lateUpdate)
                 objectClassList[stageObjectIDs[sceneInfo.entity->classID]].lateUpdate();
         }
 
         sceneInfo.entity->onScreen = 0;
-        sceneInfo.entitySlot++;
     }
 
 #if RETRO_USE_MOD_LOADER
     RunModCallbacks(MODCB_ONLATEUPDATE, INT_TO_VOID(ENGINESTATE_REGULAR));
+#endif
+#if RETRO_RENDERDEVICE_GU
+    gu_objUpdateUsecAccum += sceKernelGetSystemTimeWide() - gu_objStart;
 #endif
 }
 void RSDK::ProcessPausedObjects()
@@ -721,6 +771,9 @@ void RSDK::ProcessFrozenObjects()
 }
 void RSDK::ProcessObjectDrawLists()
 {
+#if RETRO_RENDERDEVICE_GU
+    const SceUInt64 gu_dlStart = sceKernelGetSystemTimeWide();
+#endif
     if (sceneInfo.state != ENGINESTATE_LOAD && sceneInfo.state != (ENGINESTATE_LOAD | ENGINESTATE_STEPOVER)) {
         for (int32 s = 0; s < videoSettings.screenCount; ++s) {
             currentScreen             = &screens[s];
@@ -784,6 +837,12 @@ void RSDK::ProcessObjectDrawLists()
                         else
                             ProcessParallax(layer);
 
+#if RETRO_RENDERDEVICE_GU
+                        // Queue this layer's draw for the unified per-frame
+                        // GU draw queue instead of drawing it immediately --
+                        // see GU_QueueLayerDraw() in GU/GURenderDevice.cpp.
+                        GU_QueueLayerDraw(layer);
+#else
                         switch (layer->type) {
                             case LAYER_HSCROLL: DrawLayerHScroll(layer); break;
                             case LAYER_VSCROLL: DrawLayerVScroll(layer); break;
@@ -791,6 +850,7 @@ void RSDK::ProcessObjectDrawLists()
                             case LAYER_BASIC: DrawLayerBasic(layer); break;
                             default: break;
                         }
+#endif
                     }
 
 #if RETRO_USE_MOD_LOADER
@@ -1001,6 +1061,9 @@ void RSDK::ProcessObjectDrawLists()
             sceneInfo.currentScreenID++;
         }
     }
+#if RETRO_RENDERDEVICE_GU
+    gu_objDrawListUsecAccum += sceKernelGetSystemTimeWide() - gu_dlStart;
+#endif
 }
 
 uint16 RSDK::FindObject(const char *name)
