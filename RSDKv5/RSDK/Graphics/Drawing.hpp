@@ -423,22 +423,14 @@ void DrawSprite(Animator *animator, Vector2 *position, bool32 screenRelative);
 void DrawSpriteFlipped(int32 x, int32 y, int32 width, int32 height, int32 sprX, int32 sprY, int32 direction, int32 inkEffect, int32 alpha,
                        int32 sheetID);
 #if RETRO_RENDERDEVICE_GU
-// PSP only: the actual CPU rasterizer, split out of DrawSpriteFlipped so it
-// can be called immediately (non-eligible sprites) or replayed later from
-// the GU draw queue (see GU/GURenderDevice.cpp) without duplicating the
-// per-pixel blit code. Takes the already-clipped coordinates plus the
-// pre-clip widthFlip/heightFlip the FLIP_X/FLIP_Y/FLIP_XY paths need.
+// PSP only: the actual CPU rasterizer, split out of DrawSpriteFlipped so it can be called immediately (non-eligible sprites) or replayed later from the GU draw queue (see GU/GURenderDevice.cpp)
 void DrawSpriteFlipped_CPU(int32 x, int32 y, int32 width, int32 height, int32 sprX, int32 sprY, int32 widthFlip, int32 heightFlip, int32 direction,
                             int32 inkEffect, int32 alpha, int32 sheetID);
 #endif
 void DrawSpriteRotozoom(int32 x, int32 y, int32 pivotX, int32 pivotY, int32 width, int32 height, int32 sprX, int32 sprY, int32 scaleX, int32 scaleY,
                         int32 direction, int16 Rotation, int32 inkEffect, int32 alpha, int32 sheetID);
 #if RETRO_RENDERDEVICE_GU
-// PSP only: the actual CPU rasterizer, split out of DrawSpriteRotozoom so it
-// can be replayed later from the GU draw queue in correct relative order
-// against sprite/layer/fillscreen/rect draws. Takes the already-computed
-// clip rect and per-row/per-pixel transform deltas -- see
-// GU_QueueRotozoomDraw() in GU/GURenderDevice.cpp.
+// PSP only: the actual CPU rasterizer, split out of DrawSpriteRotozoom so it can be replayed later from the GU draw queue in correct relative order against sprite/layer/fillscreen/rect draws. See GU_QueueRotozoomDraw() in GU/GURenderDevice.cpp.
 void DrawSpriteRotozoom_CPU(int32 left, int32 top, int32 xSize, int32 ySize, int32 fullX, int32 fullY, int32 fullSprX, int32 fullSprY, int32 deltaX,
                              int32 deltaY, int32 deltaXLen, int32 deltaYLen, int32 drawX, int32 drawY, int32 inkEffect, int32 alpha, int32 sheetID);
 #endif
@@ -476,10 +468,7 @@ inline void ClearGfxSurfaces()
         }
     }
 #if RETRO_RENDERDEVICE_GU
-    // Reclaim the VRAM sprite-texture arena -- it's a bump allocator with no
-    // per-sheet free, so it has to be reset wholesale here (same lifetime as
-    // the sprite sheets themselves) or it would fill up permanently over a
-    // long play session.
+    // Reclaim the VRAM sprite-texture arena
     GU_ClearSpriteTextures();
 #endif
 }
