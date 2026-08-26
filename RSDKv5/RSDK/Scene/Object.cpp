@@ -504,6 +504,8 @@ void RSDK::ProcessObjects()
         sceneInfo.entity     = &objectEntityList[e];
         sceneInfo.entitySlot = e;
 
+        // re-check inRange: update() can destroy entities mid-pass, and a stale
+        // entry here indexes typeGroups[classID] out of bounds
         if (sceneInfo.entity->inRange && sceneInfo.entity->interaction) {
             typeGroups[GROUP_ALL].entries[typeGroups[GROUP_ALL].entryCount++] = e; // All active objects
 
