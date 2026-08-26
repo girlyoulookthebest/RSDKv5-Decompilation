@@ -649,6 +649,12 @@ void RSDK::FillScreen_CPU(uint32 color, int32 alphaR, int32 alphaG, int32 alphaB
 
 void RSDK::DrawLine(int32 x1, int32 y1, int32 x2, int32 y2, uint32 color, int32 alpha, int32 inkEffect, bool32 screenRelative)
 {
+#if RETRO_RENDERDEVICE_GU
+    // Direct framebuffer write, not queued -- drain first so it lands in call
+    // order rather than underneath everything already queued.
+    GU_FlushDrawQueue();
+#endif
+
     color = ((color&0xFF)<<16)|(color&0xFF00)|((color&0xFF0000)>>16);
     switch (inkEffect) {
         default: break;
@@ -2377,6 +2383,17 @@ void RSDK::DrawBlendedFace(Vector2 *vertices, uint32 *colors, int32 vertCount, i
     return;
 }
 
+// Gouraud-shaded face fill. Note the 16-bit packing in the inner loops below:
+// R goes to bits 0-4 and B to bits 11-15, NOT the other way round.
+//
+// Upstream packs these by hand as desktop RGB565 (R in the high bits) rather
+// than going through rgb32To16_R/G/B, which is fine there -- but this port
+// swapped those tables to PSP's native GU_PSM_5650 order (R low, B high), so
+// every other draw path writes R into the low bits. These hand-written packs
+// were missed by that change, which left 3D models -- and only 3D models --
+// rendering with red and blue exchanged: Sonic came out orange and Knuckles
+// came out blue in the Special Stage, while sprites and tiles (palette-based,
+// so already converted through the swapped tables) looked correct.
 void RSDK::DrawBlendedFace_CPU(Vector2 *vertices, uint32 *colors, int32 vertCount, int32 alpha, int32 inkEffect)
 {
 #endif
@@ -2463,7 +2480,7 @@ void RSDK::DrawBlendedFace_CPU(Vector2 *vertices, uint32 *colors, int32 vertCoun
                     // `edge`, so it reloaded edge->start for every single pixel.
                     uint16 *dst = &frameBuffer[edge->start];
                     for (int32 x = 0; x < count; ++x) {
-                        dst[x] = (startB >> 19) + ((startG >> 13) & 0x7E0) + ((startR >> 8) & 0xF800);
+                        dst[x] = (startR >> 19) + ((startG >> 13) & 0x7E0) + ((startB >> 8) & 0xF800);
 
                         startR += deltaR;
                         startG += deltaG;
@@ -2516,7 +2533,7 @@ void RSDK::DrawBlendedFace_CPU(Vector2 *vertices, uint32 *colors, int32 vertCoun
                     // `edge`, so it reloaded edge->start for every single pixel.
                     uint16 *dst = &frameBuffer[edge->start];
                     for (int32 x = 0; x < count; ++x) {
-                        uint16 color = (startB >> 19) + ((startG >> 13) & 0x7E0) + ((startR >> 8) & 0xF800);
+                        uint16 color = (startR >> 19) + ((startG >> 13) & 0x7E0) + ((startB >> 8) & 0xF800);
                         setPixelBlend(color, dst[x]);
 
                         startR += deltaR;
@@ -2574,7 +2591,7 @@ void RSDK::DrawBlendedFace_CPU(Vector2 *vertices, uint32 *colors, int32 vertCoun
                     // `edge`, so it reloaded edge->start for every single pixel.
                     uint16 *dst = &frameBuffer[edge->start];
                     for (int32 x = 0; x < count; ++x) {
-                        uint16 color = (startB >> 19) + ((startG >> 13) & 0x7E0) + ((startR >> 8) & 0xF800);
+                        uint16 color = (startR >> 19) + ((startG >> 13) & 0x7E0) + ((startB >> 8) & 0xF800);
                         setPixelAlpha(color, dst[x], alpha);
 
                         startR += deltaR;
@@ -2631,7 +2648,7 @@ void RSDK::DrawBlendedFace_CPU(Vector2 *vertices, uint32 *colors, int32 vertCoun
                     // `edge`, so it reloaded edge->start for every single pixel.
                     uint16 *dst = &frameBuffer[edge->start];
                     for (int32 x = 0; x < count; ++x) {
-                        uint16 color = (startB >> 19) + ((startG >> 13) & 0x7E0) + ((startR >> 8) & 0xF800);
+                        uint16 color = (startR >> 19) + ((startG >> 13) & 0x7E0) + ((startB >> 8) & 0xF800);
                         setPixelAdditive(color, dst[x]);
 
                         startR += deltaR;
@@ -2689,7 +2706,7 @@ void RSDK::DrawBlendedFace_CPU(Vector2 *vertices, uint32 *colors, int32 vertCoun
                     // `edge`, so it reloaded edge->start for every single pixel.
                     uint16 *dst = &frameBuffer[edge->start];
                     for (int32 x = 0; x < count; ++x) {
-                        uint16 color = (startB >> 19) + ((startG >> 13) & 0x7E0) + ((startR >> 8) & 0xF800);
+                        uint16 color = (startR >> 19) + ((startG >> 13) & 0x7E0) + ((startB >> 8) & 0xF800);
                         setPixelSubtractive(color, dst[x]);
 
                         startR += deltaR;
@@ -2807,7 +2824,7 @@ void RSDK::DrawBlendedFace_CPU(Vector2 *vertices, uint32 *colors, int32 vertCoun
                     uint16 *dst = &frameBuffer[edge->start];
                     for (int32 x = 0; x < count; ++x) {
                         if (dst[x] == maskColor)
-                            dst[x] = (startB >> 19) + ((startG >> 13) & 0x7E0) + ((startR >> 8) & 0xF800);
+                            dst[x] = (startR >> 19) + ((startG >> 13) & 0x7E0) + ((startB >> 8) & 0xF800);
 
                         startR += deltaR;
                         startG += deltaG;
@@ -2862,7 +2879,7 @@ void RSDK::DrawBlendedFace_CPU(Vector2 *vertices, uint32 *colors, int32 vertCoun
                     uint16 *dst = &frameBuffer[edge->start];
                     for (int32 x = 0; x < count; ++x) {
                         if (dst[x] != maskColor)
-                            dst[x] = (startB >> 19) + ((startG >> 13) & 0x7E0) + ((startR >> 8) & 0xF800);
+                            dst[x] = (startR >> 19) + ((startG >> 13) & 0x7E0) + ((startB >> 8) & 0xF800);
 
                         startR += deltaR;
                         startG += deltaG;
@@ -4131,6 +4148,12 @@ void RSDK::DrawSpriteRotozoom_CPU(int32 left, int32 top, int32 xSize, int32 ySiz
 
 void RSDK::DrawDeformedSprite(uint16 sheetID, int32 inkEffect, int32 alpha)
 {
+#if RETRO_RENDERDEVICE_GU
+    // Direct framebuffer write, not queued -- drain first so it lands in call
+    // order. UFO_Plasma (Special Stage) and OOZ Smog both draw through this.
+    GU_FlushDrawQueue();
+#endif
+
     switch (inkEffect) {
         default: break;
         case INK_ALPHA:
@@ -4338,6 +4361,12 @@ void RSDK::DrawDeformedSprite(uint16 sheetID, int32 inkEffect, int32 alpha)
 
 void RSDK::DrawTile(uint16 *tiles, int32 countX, int32 countY, Vector2 *position, Vector2 *offset, bool32 screenRelative)
 {
+#if RETRO_RENDERDEVICE_GU
+    // Direct framebuffer write, not queued -- drain first so it lands in call
+    // order. Breakable walls, tile platforms and COverlay draw through this.
+    GU_FlushDrawQueue();
+#endif
+
     if (tiles) {
         if (!position)
             position = &sceneInfo.entity->position;
@@ -4656,6 +4685,18 @@ void RSDK::DrawString(Animator *animator, Vector2 *position, String *string, int
 }
 void RSDK::DrawDevString(const char *string, int32 x, int32 y, int32 align, uint32 color)
 {
+#if RETRO_RENDERDEVICE_GU
+    // Writes straight into currentScreen->frameBuffer rather than going
+    // through the draw queue, so everything already queued -- including the
+    // dev menu's own background rectangle -- replayed on top of it at flush
+    // time and erased it. That's why the dev menu rendered as a bare blue
+    // panel with no text at all. Draining first puts this back in call order.
+    //
+    // Cheap despite looking heavy: the first call empties the queue, so the
+    // remaining strings in the same menu flush over zero entries.
+    GU_FlushDrawQueue();
+#endif
+
     color = ((color&0xFF)<<16)|(color&0xFF00)|((color&0xFF0000)>>16);
     uint16 color16 = rgb32To16_R[(color >> 0) & 0xFF] | rgb32To16_G[(color >> 8) & 0xFF] | rgb32To16_B[(color >> 16) & 0xFF];
 

@@ -2,6 +2,12 @@
 
 using namespace RSDK;
 
+// Development shortcut: boot straight into a stage. -1 disables it (normal
+// builds). Category indices match the dev menu's stage list; 3 is the
+// Special Stage. See where these are applied in LoadGameConfig below.
+#define RETRO_BOOT_CATEGORY -1
+#define RETRO_BOOT_SCENE    0
+
 #if RETRO_REV0U
 #include "Legacy/RetroEngineLegacy.cpp"
 #endif
@@ -1198,6 +1204,18 @@ void RSDK::LoadGameConfig()
 #endif
 
         sceneInfo.listPos = sceneInfo.listCategory[sceneInfo.activeCategory].sceneOffsetStart + startScene;
+
+#if RETRO_BOOT_CATEGORY >= 0
+        // Development shortcut: boot straight into a specific stage instead of
+        // the title sequence, so a bug can be reproduced without playing
+        // through menus. Category order matches the dev menu's stage list
+        // (0 Presentation, 1 Mania Mode, 2 Encore Mode, 3 Special Stage, ...).
+        // Keep RETRO_BOOT_CATEGORY at -1 for normal builds.
+        if (RETRO_BOOT_CATEGORY < sceneInfo.categoryCount) {
+            sceneInfo.activeCategory = RETRO_BOOT_CATEGORY;
+            sceneInfo.listPos = sceneInfo.listCategory[RETRO_BOOT_CATEGORY].sceneOffsetStart + RETRO_BOOT_SCENE;
+        }
+#endif
     }
 }
 

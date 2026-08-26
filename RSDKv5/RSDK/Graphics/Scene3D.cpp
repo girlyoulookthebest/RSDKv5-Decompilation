@@ -21,6 +21,10 @@ SceUInt64 gu_s3dMeshUsec = 0;  // per-vertex transform (AddMeshFrameToScene)
 SceUInt64 gu_s3dSortUsec = 0;  // depth sort
 SceUInt64 gu_s3dDrawUsec = 0;  // face rasterizing
 extern int32 gu_profilingEnabled;
+
+// Diagnostic: dump each 3D model's flags/colors once to model_dbg.log.
+// Development tool -- keep at 0 for normal builds.
+#define S3D_DUMP_MODEL_INFO 0
 #define S3D_TIME_BEGIN(acc) const SceUInt64 acc##_t0 = gu_profilingEnabled ? sceKernelGetSystemTimeWide() : 0
 #define S3D_TIME_END(acc)                                                                                                                            \
     if (gu_profilingEnabled)                                                                                                                         \
@@ -491,6 +495,22 @@ uint16 RSDK::LoadMesh(const char *filename, uint8 scope)
         }
 
         CloseFile(&info);
+
+#if S3D_DUMP_MODEL_INFO
+        {
+            FILE *df = fopen("model_dbg.log", "a");
+            if (df) {
+                fprintf(df, "LOAD id=%d \"%s\" flags=0x%02X fvc=%d verts=%d frames=%d colors=%s", id, fullFilePath, model->flags,
+                        model->faceVertCount, model->vertCount, model->frameCount, (model->flags & MODEL_USECOLOURS) ? "yes" : "no");
+                if (model->flags & MODEL_USECOLOURS)
+                    for (int32 ci = 0; ci < 6 && ci < model->vertCount; ++ci)
+                        fprintf(df, " c%d=%06X", ci, (unsigned int)(model->colors[ci].color & 0xFFFFFF));
+                fprintf(df, "\n");
+                fclose(df);
+            }
+        }
+#endif
+
         return id;
     }
     return -1;
@@ -546,6 +566,29 @@ void RSDK::AddModelToScene(uint16 modelFrames, uint16 sceneIndex, uint8 drawMode
     if (modelFrames < MODEL_COUNT && sceneIndex < SCENE3D_COUNT) {
         if (matWorld) {
             Model *mdl            = &modelList[modelFrames];
+
+#if S3D_DUMP_MODEL_INFO
+            {
+                static uint8 s3dDumpedM[MODEL_COUNT] = { 0 };
+                if (!s3dDumpedM[modelFrames]) {
+                    s3dDumpedM[modelFrames] = 1;
+                    FILE *df                = fopen("model_dbg.log", "a");
+                    if (df) {
+                        Scene3D *dscn = &scene3DList[sceneIndex];
+                        fprintf(df, "model model=%d flags=0x%02X fvc=%d verts=%d drawMode=%d inColor=%06X colors=%s", modelFrames, mdl->flags,
+                                mdl->faceVertCount, mdl->vertCount, drawMode, (unsigned int)(color & 0xFFFFFF), mdl->colors ? "yes" : "NULL");
+                        if (mdl->colors)
+                            for (int32 ci = 0; ci < 6 && ci < mdl->vertCount; ++ci)
+                                fprintf(df, " c%d=%06X", ci, (unsigned int)(mdl->colors[ci].color & 0xFFFFFF));
+                        fprintf(df, " | diff=%d,%d,%d diffI=%d,%d,%d specI=%d,%d,%d\n", dscn->diffuseX, dscn->diffuseY, dscn->diffuseZ,
+                                dscn->diffuseIntensityX, dscn->diffuseIntensityY, dscn->diffuseIntensityZ, dscn->specularIntensityX,
+                                dscn->specularIntensityY, dscn->specularIntensityZ);
+                        fclose(df);
+                    }
+                }
+            }
+#endif
+
             // Matrix elements hoisted into locals.
             //
             // The transform loops below write through `vertex`, which the
@@ -713,6 +756,34 @@ void RSDK::AddMeshFrameToScene(uint16 modelFrames, uint16 sceneIndex, Animator *
     if (modelFrames < MODEL_COUNT && sceneIndex < SCENE3D_COUNT) {
         if (matWorld && animator) {
             Model *mdl            = &modelList[modelFrames];
+
+#if S3D_DUMP_MODEL_INFO
+            // One-shot per model: which flags branch this model takes, and
+            // what its own vertex colors are. Only MODEL_USENORMALS |
+            // MODEL_USECOLOURS uses mdl->colors -- every other value falls to
+            // `default:` and paints with the caller's flat color instead.
+            {
+                static uint8 s3dDumped[MODEL_COUNT] = { 0 };
+                if (!s3dDumped[modelFrames]) {
+                    s3dDumped[modelFrames] = 1;
+                    FILE *df               = fopen("model_dbg.log", "a");
+                    if (df) {
+                        Scene3D *dscn = &scene3DList[sceneIndex];
+                        fprintf(df, "mesh model=%d flags=0x%02X fvc=%d verts=%d frames=%d drawMode=%d inColor=%06X colors=%s",
+                                modelFrames, mdl->flags, mdl->faceVertCount, mdl->vertCount, mdl->frameCount, drawMode,
+                                (unsigned int)(color & 0xFFFFFF), mdl->colors ? "yes" : "NULL");
+                        if (mdl->colors)
+                            for (int32 ci = 0; ci < 6 && ci < mdl->vertCount; ++ci)
+                                fprintf(df, " c%d=%06X", ci, (unsigned int)(mdl->colors[ci].color & 0xFFFFFF));
+                        fprintf(df, " | diff=%d,%d,%d diffI=%d,%d,%d specI=%d,%d,%d\n", dscn->diffuseX, dscn->diffuseY, dscn->diffuseZ,
+                                dscn->diffuseIntensityX, dscn->diffuseIntensityY, dscn->diffuseIntensityZ, dscn->specularIntensityX,
+                                dscn->specularIntensityY, dscn->specularIntensityZ);
+                        fclose(df);
+                    }
+                }
+            }
+#endif
+
             // Matrix elements hoisted into locals.
             //
             // The transform loops below write through `vertex`, which the
@@ -1337,6 +1408,27 @@ void RSDK::Draw3DScene(uint16 sceneID)
                             r = CLAMP(r, 0x00, 0xFF);
                             g = CLAMP(g, 0x00, 0xFF);
                             b = CLAMP(b, 0x00, 0xFF);
+
+#if S3D_DUMP_MODEL_INFO
+                            // What the shading actually does to a vertex: the
+                            // model color in, the normal driving it, and the
+                            // color out. Washed-out output here means the
+                            // specular term is swamping the base color.
+                            {
+                                static int32 s3dShadeDumps = 0;
+                                if (s3dShadeDumps < 12) {
+                                    ++s3dShadeDumps;
+                                    FILE *df = fopen("model_dbg.log", "a");
+                                    if (df) {
+                                        fprintf(df, "SHADE in=%06X ny=%d normalVal=%d specTerm=%d -> out=%02X%02X%02X\n",
+                                                (unsigned int)(drawVert[v].color & 0xFFFFFF), (int)normal, (int)normalVal,
+                                                (int)CLAMP(normalVal >> 6 >> s3dSpecIX, 0x00, 0xFF), (unsigned int)r, (unsigned int)g,
+                                                (unsigned int)b);
+                                        fclose(df);
+                                    }
+                                }
+                            }
+#endif
 
                             vertClrs[v] = (r << 16) | (g << 8) | (b << 0);
                         }

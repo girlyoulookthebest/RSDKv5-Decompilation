@@ -488,6 +488,14 @@ struct GUQueueEntry {
 static GUQueueEntry gu_draw_queue[GU_DRAW_QUEUE_MAX];
 static int32 gu_draw_queue_count = 0;
 
+// Queue-pressure diagnostics. gu_queuePeak is the deepest the queue got over
+// the logging window; gu_queueDrains counts how many times it filled and had
+// to be drained mid-frame. A non-zero drain count means this scene generates
+// more than GU_DRAW_QUEUE_MAX draws per frame -- which used to silently
+// corrupt draw order, and is the reason the Special Stage rendered wrong.
+static int32 gu_queuePeak   = 0;
+static int32 gu_queueDrains = 0;
+
 // Per-draw-type time/count accounting, indexed by GUQueueEntryType and
 // accumulated across the reporting window. See the flush loop.
 #define GU_ENTRY_TYPE_COUNT 9
@@ -766,9 +774,41 @@ static void GU_SyncSpriteBatchIfActive()
 // normal operation); the switch stays for future A/Bs.
 #define GU_BYPASS_DRAW_QUEUE 0
 
-// Queues one sprite draw. If the queue is full (shouldn't happen in
-// practice -- generous headroom) draws immediately instead of dropping it,
-// same fallback philosophy as the rest of this file.
+// Defined below, forward-declared so the queue functions can drain the queue
+// when it fills. See GU_DrainQueueIfFull.
+void GU_FlushDrawQueue();
+
+// What to do when a draw can't be queued -- either the queue is full, or the
+// entry is structurally unqueueable (a face with more verts than
+// MAX_FACE_VERTS).
+//
+// Drawing it immediately, which is what this used to do, is WRONG: everything
+// queued before it is still sitting in the queue unreplayed, so an immediate
+// draw lands underneath draws that were issued before it, and the queued ones
+// then paint over it at flush time. That's the exact ordering hazard called
+// out in the queue's header comment -- the one the earlier sprite-only GPU
+// attempt hit -- reintroduced here in the overflow path.
+//
+// The fix is to drain first: replaying the queue empties it in call order, so
+// by the time the immediate draw (or the freshly-queued entry) happens,
+// everything before it has already landed. Order is preserved either way.
+//
+// This is not hypothetical. 2048 entries is generous for normal gameplay, but
+// the Special Stage blows straight through it: every 3D face is one entry, and
+// the "View:Special" scene alone is 4096 verts (~1000-1300 faces per
+// Draw3DScene) shared by UFO_Circuit, UFO_Decoration, UFO_Player, UFO_Shadow
+// and UFO_Springboard, each of which prepares and draws its own batch every
+// frame, on top of the usual sprites and layers.
+static void GU_DrainQueueIfFull()
+{
+    if (gu_draw_queue_count >= GU_DRAW_QUEUE_MAX || gu_layer_queue_count >= GU_LAYER_QUEUE_MAX) {
+        ++gu_queueDrains;
+        GU_FlushDrawQueue();
+    }
+}
+
+// Queues one sprite draw. If the queue is full it's drained first (see
+// GU_DrainQueueIfFull) rather than dropping the draw or reordering it.
 void GU_QueueSpriteDraw(int32 x, int32 y, int32 width, int32 height, int32 sprX, int32 sprY, int32 widthFlip, int32 heightFlip, int32 direction,
                          int32 inkEffect, int32 alpha, int32 sheetID)
 {
@@ -777,10 +817,7 @@ void GU_QueueSpriteDraw(int32 x, int32 y, int32 width, int32 height, int32 sprX,
     return;
 #endif
 
-    if (gu_draw_queue_count >= GU_DRAW_QUEUE_MAX) {
-        DrawSpriteFlipped_CPU(x, y, width, height, sprX, sprY, widthFlip, heightFlip, direction, inkEffect, alpha, sheetID);
-        return;
-    }
+    GU_DrainQueueIfFull();
 
     GUQueueEntry *e     = &gu_draw_queue[gu_draw_queue_count++];
     e->type             = GU_ENTRY_SPRITE;
@@ -837,12 +874,7 @@ void RSDK::GU_QueueLayerDraw(TileLayer *layer)
     return;
 #endif
 
-    if (gu_draw_queue_count >= GU_DRAW_QUEUE_MAX || gu_layer_queue_count >= GU_LAYER_QUEUE_MAX) {
-        // No room to defer -- draw immediately with whatever's currently in
-        // `scanlines`, matching today's behavior exactly for this entry.
-        GU_DrawLayerImmediate(layer);
-        return;
-    }
+    GU_DrainQueueIfFull();
 
     GULayerEntry *le    = &gu_layer_queue[gu_layer_queue_count];
     le->layer           = layer;
@@ -865,10 +897,7 @@ void GU_QueueFillScreen(uint32 color, int32 alphaR, int32 alphaG, int32 alphaB)
     return;
 #endif
 
-    if (gu_draw_queue_count >= GU_DRAW_QUEUE_MAX) {
-        FillScreen_CPU(color, alphaR, alphaG, alphaB);
-        return;
-    }
+    GU_DrainQueueIfFull();
 
     GUQueueEntry *e          = &gu_draw_queue[gu_draw_queue_count++];
     e->type                  = GU_ENTRY_FILLSCREEN;
@@ -889,10 +918,7 @@ void GU_QueueRectDraw(int32 x, int32 y, int32 width, int32 height, uint32 color,
     return;
 #endif
 
-    if (gu_draw_queue_count >= GU_DRAW_QUEUE_MAX) {
-        DrawRectangle_CPU(x, y, width, height, color, alpha, inkEffect);
-        return;
-    }
+    GU_DrainQueueIfFull();
 
     GUQueueEntry *e    = &gu_draw_queue[gu_draw_queue_count++];
     e->type            = GU_ENTRY_RECT;
@@ -918,11 +944,7 @@ void GU_QueueRotozoomDraw(int32 left, int32 top, int32 xSize, int32 ySize, int32
     return;
 #endif
 
-    if (gu_draw_queue_count >= GU_DRAW_QUEUE_MAX) {
-        DrawSpriteRotozoom_CPU(left, top, xSize, ySize, fullX, fullY, fullSprX, fullSprY, deltaX, deltaY, deltaXLen, deltaYLen, drawX, drawY,
-                               inkEffect, alpha, sheetID);
-        return;
-    }
+    GU_DrainQueueIfFull();
 
     GUQueueEntry *e     = &gu_draw_queue[gu_draw_queue_count++];
     e->type             = GU_ENTRY_ROTOZOOM;
@@ -961,10 +983,15 @@ void GU_QueueFaceDraw(Vector2 *vertices, int32 vertCount, int32 b, int32 g, int3
     return;
 #endif
 
-    if (gu_draw_queue_count >= GU_DRAW_QUEUE_MAX || vertCount > MAX_FACE_VERTS) {
+    if (vertCount > MAX_FACE_VERTS) {
+        // Too many verts to fit an entry -- drain first so this still lands in
+        // call order rather than underneath everything already queued.
+        GU_FlushDrawQueue();
         DrawFace_CPU(vertices, vertCount, b, g, r, alpha, inkEffect);
         return;
     }
+
+    GU_DrainQueueIfFull();
 
     GUQueueEntry *e         = &gu_draw_queue[gu_draw_queue_count++];
     e->type                 = GU_ENTRY_FACE;
@@ -987,10 +1014,15 @@ void GU_QueueBlendedFaceDraw(Vector2 *vertices, uint32 *colors, int32 vertCount,
     return;
 #endif
 
-    if (gu_draw_queue_count >= GU_DRAW_QUEUE_MAX || vertCount > MAX_FACE_VERTS) {
+    if (vertCount > MAX_FACE_VERTS) {
+        // Too many verts to fit an entry -- drain first so this still lands in
+        // call order rather than underneath everything already queued.
+        GU_FlushDrawQueue();
         DrawBlendedFace_CPU(vertices, colors, vertCount, alpha, inkEffect);
         return;
     }
+
+    GU_DrainQueueIfFull();
 
     GUQueueEntry *e                  = &gu_draw_queue[gu_draw_queue_count++];
     e->type                          = GU_ENTRY_BLENDEDFACE;
@@ -1011,10 +1043,7 @@ void GU_QueueCircleDraw(int32 x, int32 y, int32 radius, uint32 color, int32 alph
     return;
 #endif
 
-    if (gu_draw_queue_count >= GU_DRAW_QUEUE_MAX) {
-        DrawCircle_CPU(x, y, radius, color, alpha, inkEffect);
-        return;
-    }
+    GU_DrainQueueIfFull();
 
     GUQueueEntry *e             = &gu_draw_queue[gu_draw_queue_count++];
     e->type                     = GU_ENTRY_CIRCLE;
@@ -1036,10 +1065,7 @@ void GU_QueueCircleOutlineDraw(int32 x, int32 y, int32 innerRadius, int32 outerR
     return;
 #endif
 
-    if (gu_draw_queue_count >= GU_DRAW_QUEUE_MAX) {
-        DrawCircleOutline_CPU(x, y, innerRadius, outerRadius, color, alpha, inkEffect);
-        return;
-    }
+    GU_DrainQueueIfFull();
 
     GUQueueEntry *e                    = &gu_draw_queue[gu_draw_queue_count++];
     e->type                            = GU_ENTRY_CIRCLEOUTLINE;
@@ -1189,6 +1215,10 @@ void GU_FlushDrawQueue()
 
     currentScreen = realCurrentScreen;
     memcpy(gfxLineBuffer, realLineBuffer, SCREEN_YSIZE);
+
+    if (gu_draw_queue_count > gu_queuePeak)
+        gu_queuePeak = gu_draw_queue_count;
+
     gu_draw_queue_count  = 0;
     gu_layer_queue_count = 0;
 }
@@ -1527,6 +1557,11 @@ static void GU_UpdateFPSCounter()
                         (double)gu_profCount[GU_ENTRY_BLENDEDFACE] / frameCount, (double)gu_profUsec[GU_ENTRY_CIRCLEOUTLINE] / 1000.0 / frameCount,
                         (double)gu_profCount[GU_ENTRY_CIRCLEOUTLINE] / frameCount, (double)gu_profUsec[GU_ENTRY_RECT] / 1000.0 / frameCount,
                         (double)gu_profUsec[GU_ENTRY_CIRCLE] / 1000.0 / frameCount);
+                fprintf(h, "     queue: peak %4d / %d  drains %d  (drains > 0 means the frame exceeded the queue)\n", gu_queuePeak,
+                        GU_DRAW_QUEUE_MAX, gu_queueDrains);
+                gu_queuePeak   = 0;
+                gu_queueDrains = 0;
+
                 fprintf(h, "     flip breakdown: build %5.2f  enqueue %5.2f  finish %5.2f  sync %5.2f  start %5.2f  |  roto %5.2f\n",
                         (double)gu_flipBuildUsec / 1000.0 / frameCount, (double)gu_flipEnqUsec / 1000.0 / frameCount,
                         (double)gu_flipFinUsec / 1000.0 / frameCount, (double)gu_flipSyncUsec / 1000.0 / frameCount,
