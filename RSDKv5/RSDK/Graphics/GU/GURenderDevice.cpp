@@ -88,6 +88,7 @@ using namespace RSDK;
 #define GE_CMD_TBW0   0xA8
 #define GE_CMD_TSIZE0 0xB8
 #define GE_CMD_TFLUSH 0xCB
+#define GE_CMD_TSYNC  0xCC
 #define GE_CMD_CLEAR  0xD3
 #define GE_CMD_VTYPE  0x12
 #define GE_CMD_BASE   0x10
@@ -122,6 +123,21 @@ using namespace RSDK;
 // END -- so the present quad has always been correctly terminated, and the
 // "missing END" this was originally added to fix never existed.
 #define GE_CMD_END      0x0C
+// Texture and CLUT, also taken from libpspgu.a.
+#define GE_CMD_TSCALEU  0x48
+#define GE_CMD_TSCALEV  0x49
+#define GE_CMD_TOFFSETU 0x4A
+#define GE_CMD_TOFFSETV 0x4B
+#define GE_CMD_CBP      0xB0
+#define GE_CMD_CBPH     0xB1
+#define GE_CMD_TMODE    0xC2
+#define GE_CMD_TPSM     0xC3
+#define GE_CMD_CLOAD    0xC4
+#define GE_CMD_CMODE    0xC5
+#define GE_CMD_TFLT     0xC6
+#define GE_CMD_TWRAP    0xC7
+#define GE_CMD_TFUNC    0xC9
+#define GE_CMD_ATST     0xdb
 
 // Present-quad vertices, in main RAM and double-buffered.
 //
@@ -367,6 +383,7 @@ enum GUQueueEntryType {
     GU_ENTRY_FACE,
     GU_ENTRY_BLENDEDFACE,
     GU_ENTRY_FACEBATCH,
+    GU_ENTRY_TILEBATCH,
     GU_ENTRY_CIRCLE,
     GU_ENTRY_CIRCLEOUTLINE
 };
@@ -507,6 +524,88 @@ struct GUFaceVertex {
     s16 pad;
 };
 
+// --- Tile layer atlas (Stage C) -----------------------------------------
+//
+// Set to 1 to build the tileset atlas and draw it on screen for
+// verification. This exists to prove texture upload, CLUT and sampling
+// independently of any layer geometry -- the same approach the 3D face path
+// was brought up with.
+#define GU_TILE_ATLAS_TEST 0
+#define GU_FB_DUMP    0
+#define GU_FB_DUMP_AT 600
+
+// Draws one tile through the GE and diffs it against the CPU result. Use this
+// instead of inspecting screenshots -- the framebuffer is the ground truth.
+#define GU_TILE_SELFTEST 0
+
+// The tileset is TILE_COUNT (1024) tiles of 16x16 8-bit palette indices,
+// which is exactly a 512x512 texture at 32x32 tiles. tilesetPixels actually
+// holds FOUR copies (one per flip variant), but only FLIP_NONE is uploaded:
+// the GE flips by swapping texture coordinates, so the other three are free.
+#define GU_ATLAS_DIM       512
+#define GU_ATLAS_TILES_ROW (GU_ATLAS_DIM / TILE_SIZE) // 32
+static u8 *gu_tile_atlas       = NULL;
+static int32 gu_tile_atlas_ok  = 0;
+static int32 gu_atlas_scene    = -1; // listPos the atlas was built for
+// Why layers get refused by GU_TryQueueLayerGPU, indexed by reason. Every
+// refusal is silent otherwise, which makes "nothing went to the GE" and
+// "everything went to the GE and drew nothing" look identical from outside.
+static int32 gu_tile_decline[9] = { 0 };
+// Which palette bank the GE currently holds in its CLUT, reset each frame
+// because the present list runs in between and may leave anything loaded.
+static int32 gu_clutLoadedBank = -1;
+#define GU_DECLINE(n) do { ++gu_tile_decline[(n)]; return false; } while (0)
+
+// Textured 2D vertex: GU_TEXTURE_16BIT | GU_VERTEX_16BIT | GU_TRANSFORM_2D.
+// Component order is fixed by the hardware: texture coords, then position.
+// All members are 16-bit so the 10-byte stride is legal as-is.
+struct GUTexVertex {
+    s16 u, v;
+    s16 x, y, z;
+};
+
+// Repacks tilesetPixels into the atlas. Tile N lands at column N&31, row N>>5.
+//
+// The source is tile-major (256 consecutive bytes per tile), so this is 16
+// row copies per tile rather than one -- 1024 tiles x 16 rows of 16 bytes.
+// Done once per scene, not per frame.
+// --- GPU tile layers (Stage C) ------------------------------------------
+//
+// Set to 1 to route eligible tile layers to the GE. Off until verified.
+#define GU_GPU_TILES 0
+
+// One quad per visible tile: 27x16 covers a 424x240 screen with a partial
+// tile at each edge, so ~432 quads (864 verts) per layer, a handful of
+// layers per frame.
+#define GU_TILE_VERT_WANT 4096
+static GUTexVertex *gu_tile_verts   = NULL;
+static int32 gu_tile_vert_count     = 0;
+static int32 gu_tile_vert_max       = 0;
+static SceUInt64 gu_tileDmaUsec = 0, gu_tileGeUsec = 0;
+static int32 gu_tileBatchCount = 0, gu_tileQuadCount = 0;
+
+struct GUTileBatchEntry {
+    int32 firstVert, vertCount, bank;
+    // Snapshot, not a pointer: clipBound_* are rewritten on the live
+    // ScreenInfo as the frame draws, so by flush time they no longer
+    // describe the region this layer was clipped to. Reading them late
+    // gave SCISSOR2 a -1 and scissored the whole layer away.
+    ScreenInfo screenSnapshot;
+};
+
+// Builds the quads for one BASIC layer, or returns false to leave it on the
+// CPU path.
+//
+// BASIC is the tractable case: DrawLayerBasic uses fullPalette[0] for the
+// whole layer and a single scroll offset taken from the first scanline, so
+// the layer is a plain tile grid. HSCROLL is the same shape (its scanline x
+// span measures 0, i.e. all lines share a scroll) but is left alone for now.
+// ROTOZOOM genuinely varies per scanline and stays on the CPU.
+//
+// Deliberately mirrors DrawLayerBasic rather than improving on it: the tile
+// index is masked with 0xFFF and flip bits are IGNORED, because the CPU path
+// ignores them too -- matching output matters more than correctness here.
+
 // --- GPU face batching (Stage B) ----------------------------------------
 //
 // Set to 1 to route eligible 3D faces to the GE instead of the CPU
@@ -530,6 +629,10 @@ static int32 gu_face_vert_count = 0;
 // Per-window profiling for the GPU face path.
 static SceUInt64 gu_faceDmaUsec = 0, gu_faceGeUsec = 0;
 static int32 gu_faceBatchCount = 0, gu_faceTriCount = 0;
+
+// Tile-layer profiling: cost per layer type, and scanline-band counts.
+static SceUInt64 gu_layerTypeUsec[4] = { 0, 0, 0, 0 };
+static int32 gu_layerBands = 0, gu_layerBandSamples = 0;
 
 // A run of consecutive GPU faces, replayed as one GE draw. Consecutive
 // eligible faces extend the open batch rather than each taking a queue slot,
@@ -578,6 +681,7 @@ struct GUQueueEntry {
         GUFaceEntry face;
         GUBlendedFaceEntry blendedFace;
         GUFaceBatchEntry faceBatch;
+        GUTileBatchEntry tileBatch;
         GUCircleEntry circle;
         GUCircleOutlineEntry circleOutline;
     };
@@ -886,6 +990,10 @@ void GU_FlushDrawQueue();
 #if GU_GPU_FACES
 static void GU_DrawFaceBatch(int32 firstVert, int32 vertCount);
 #endif
+#if GU_GPU_TILES || GU_TILE_SELFTEST || GU_TILE_ATLAS_TEST
+static void GU_DrawTileBatch(int32 firstVert, int32 vertCount, int32 bank);
+static void GU_DrawTileBatchRun(int32 firstEntry, int32 entryCount);
+#endif
 
 // What to do when a draw can't be queued -- either the queue is full, or the
 // entry is structurally unqueueable (a face with more verts than
@@ -967,6 +1075,59 @@ static void GU_DrawLayerImmediate(TileLayer *layer)
     }
 #endif
 
+#if GU_ENABLE_PROFILING
+    // Cost per layer type, and the number of distinct per-scanline scroll
+    // values (bands). One band means the whole layer can be drawn as a
+    // single grid of tile quads on the GE; 240 bands means it cannot.
+    const SceUInt64 layerT0 = sceKernelGetSystemTimeWide();
+    {
+        static uint32 seenDims[64];
+        static int32 seenCount = 0;
+        const uint32 key = ((uint32)layer->type << 28) ^ ((uint32)layer->xsize << 14) ^ (uint32)layer->ysize;
+        int32 known = 0;
+        for (int32 i = 0; i < seenCount; ++i)
+            if (seenDims[i] == key) { known = 1; break; }
+        if (!known && seenCount < 64) {
+            seenDims[seenCount++] = key;
+            int32 minX = 0x7FFFFFFF, maxX = -0x7FFFFFFF;
+            int32 minY = 0x7FFFFFFF, maxY = -0x7FFFFFFF;
+            int32 minDX = 0x7FFFFFFF, maxDX = -0x7FFFFFFF;
+            for (int32 cy = currentScreen->clipBound_Y1; cy < currentScreen->clipBound_Y2; ++cy) {
+                const ScanlineInfo *s = &scanlines[cy];
+                const int32 px = s->position.x >> 16, py = s->position.y >> 16;
+                if (px < minX) minX = px;   if (px > maxX) maxX = px;
+                if (py < minY) minY = py;   if (py > maxY) maxY = py;
+                if (s->deform.x < minDX) minDX = s->deform.x;
+                if (s->deform.x > maxDX) maxDX = s->deform.x;
+            }
+            FILE *lf = fopen("layer_dims.log", "a");
+            if (lf) {
+                fprintf(lf, "type=%d (0=H 1=V 2=ROTO 3=BASIC)  size=%dx%d tiles (%dx%d px)\n",
+                        (int)layer->type, (int)layer->xsize, (int)layer->ysize,
+                        (int)layer->xsize * 16, (int)layer->ysize * 16);
+                fprintf(lf, "   scanline x span = %d..%d (%d px)   y span = %d..%d (%d px)\n",
+                        (int)minX, (int)maxX, (int)(maxX - minX), (int)minY, (int)maxY, (int)(maxY - minY));
+                fprintf(lf, "   deform.x span   = %d..%d\n\n", (int)minDX, (int)maxDX);
+                fclose(lf);
+            }
+        }
+    }
+    if (layer->type == LAYER_HSCROLL) {
+        int32 bands = 0;
+        int32 lastX = 0x7FFFFFFF, lastY = 0x7FFFFFFF;
+        for (int32 cy = currentScreen->clipBound_Y1; cy < currentScreen->clipBound_Y2; ++cy) {
+            const ScanlineInfo *s = &scanlines[cy];
+            if (s->position.x != lastX || s->position.y != lastY) {
+                ++bands;
+                lastX = s->position.x;
+                lastY = s->position.y;
+            }
+        }
+        gu_layerBands += bands;
+        gu_layerBandSamples++;
+    }
+#endif
+
     switch (layer->type) {
         case LAYER_HSCROLL: DrawLayerHScroll(layer); break;
         case LAYER_VSCROLL: DrawLayerVScroll(layer); break;
@@ -974,8 +1135,142 @@ static void GU_DrawLayerImmediate(TileLayer *layer)
         case LAYER_BASIC: DrawLayerBasic(layer); break;
         default: break;
     }
+#if GU_ENABLE_PROFILING
+    if (layer->type >= 0 && layer->type < 4)
+        gu_layerTypeUsec[layer->type] += sceKernelGetSystemTimeWide() - layerT0;
+#endif
 }
 
+
+static bool GU_TryQueueLayerGPU(TileLayer *layer)
+{
+    if (layer->type != LAYER_BASIC && layer->type != LAYER_HSCROLL)
+        GU_DECLINE(0);
+    if (!gu_tile_atlas_ok)
+        GU_DECLINE(1);
+    if (!gu_tile_verts)
+        GU_DECLINE(2);
+    if (gu_atlas_scene != sceneInfo.listPos)
+        GU_DECLINE(3); // atlas still holds the previous stage's tileset
+    if (!layer->xsize || !layer->ysize)
+        GU_DECLINE(4);
+    if (currentScreen->clipBound_X1 >= currentScreen->clipBound_X2 || currentScreen->clipBound_Y1 >= currentScreen->clipBound_Y2)
+        GU_DECLINE(5);
+
+    const int32 clipX1 = currentScreen->clipBound_X1, clipX2 = currentScreen->clipBound_X2;
+    const int32 clipY1 = currentScreen->clipBound_Y1, clipY2 = currentScreen->clipBound_Y2;
+
+    // HSCROLL is only a grid when every scanline shares one x scroll.
+    // Measured on hardware it does (x span 0 across 240 lines) -- y just
+    // advances a line at a time, same as BASIC -- but that is a property
+    // of the scene, not a guarantee, so check it rather than assume.
+    // Deformation, if any scene uses it, shows up here as a varying x.
+    //
+    // The palette must be uniform too: DrawLayerHScroll reads a bank per
+    // scanline from gfxLineBuffer, and the Special Stage genuinely varies
+    // it per line for its horizon gradient. One CLUT cannot express that,
+    // so those layers stay on the CPU.
+    int32 bank = 0;
+    if (layer->type == LAYER_HSCROLL) {
+        const int32 x0 = scanlines[clipY1].position.x;
+        for (int32 cy = clipY1 + 1; cy < clipY2; ++cy)
+            if (scanlines[cy].position.x != x0)
+                GU_DECLINE(6);
+        if (!GU_PaletteUniform(clipY1, clipY2 - clipY1, &bank))
+            GU_DECLINE(7);
+    }
+
+    const ScanlineInfo *scanline = &scanlines[clipY1];
+    // The two layer types differ in where a row starts, and getting this
+    // wrong shifts the whole layer: DrawLayerBasic begins at
+    // clipBound_X1, but DrawLayerHScroll begins at framebuffer offset 0
+    // and spans the full pitch.
+    const int32 originX = (layer->type == LAYER_BASIC) ? clipX1 : 0;
+    const int32 spanX   = (layer->type == LAYER_BASIC) ? (clipX2 - clipX1) : (int32)currentScreen->pitch;
+    const int32 worldX = originX + FROM_FIXED(scanline->position.x);
+    const int32 worldY = FROM_FIXED(scanline->position.y);
+    const int32 sheetX = worldX & 0xF, sheetY = worldY & 0xF;
+    const int32 tx0 = worldX >> 4, ty0 = worldY >> 4;
+
+    const int32 cols = (spanX + sheetX + TILE_SIZE - 1) / TILE_SIZE + 1;
+    const int32 rows = ((clipY2 - clipY1) + sheetY + TILE_SIZE - 1) / TILE_SIZE + 1;
+
+    if (gu_tile_vert_count + cols * rows * 2 > gu_tile_vert_max)
+        GU_DECLINE(8); // no room -- CPU path rather than a partial layer
+
+    gu_tile_vert_count = (gu_tile_vert_count + 7) & ~7;
+    if (gu_tile_vert_count + cols * rows * 2 > gu_tile_vert_max)
+        GU_DECLINE(8);
+    const int32 firstVert = gu_tile_vert_count;
+
+    for (int32 j = 0; j < rows; ++j) {
+        int32 ty = ty0 + j;
+        ty %= layer->ysize;
+        if (ty < 0)
+            ty += layer->ysize;
+
+        const uint16 *row = &layer->layout[ty << layer->widthShift];
+        const int32 sy    = clipY1 - sheetY + j * TILE_SIZE;
+
+        for (int32 i = 0; i < cols; ++i) {
+            int32 tx = tx0 + i;
+            tx %= layer->xsize;
+            if (tx < 0)
+                tx += layer->xsize;
+
+            const uint16 entry = row[tx];
+            if (entry == 0xFFFF)
+                continue; // empty tile
+
+            // Index is 10 bits: TILE_COUNT is 0x400. Bits 10-11 are the flip
+            // flags (FlipFlags: 1 = X, 2 = Y), which the CPU path resolves by
+            // indexing pre-generated variants in tilesetPixels[TILESET_SIZE*4].
+            // Masking with 0xFFF folded those flags into the index, so every
+            // flipped tile pointed past the 1024 tiles the atlas holds, sampled
+            // empty atlas, and vanished -- which is why foreground layers (lots
+            // of mirrored tiles) disappeared while skies rendered fine.
+            const int32 tile = entry & 0x3FF;
+            const int32 flip = (entry >> 10) & 3;
+            const int32 au   = (tile % GU_ATLAS_TILES_ROW) * TILE_SIZE;
+            const int32 av   = (tile / GU_ATLAS_TILES_ROW) * TILE_SIZE;
+            const int32 sx   = originX - sheetX + i * TILE_SIZE;
+
+            GUTexVertex *v = &gu_tile_verts[gu_tile_vert_count];
+            gu_tile_vert_count += 2;
+
+            // Flip by swapping texture coordinates instead of packing all four
+            // variants: 4096 tiles would need a 1024x1024 atlas (1MB), and the
+            // GE mirrors for free when the second corner's u/v run backwards.
+            s16 u0 = (s16)au, u1 = (s16)(au + TILE_SIZE);
+            s16 v0 = (s16)av, v1 = (s16)(av + TILE_SIZE);
+            if (flip & 1) { const s16 t = u0; u0 = u1; u1 = t; }
+            if (flip & 2) { const s16 t = v0; v0 = v1; v1 = t; }
+
+            // GU_SPRITES takes two corners. Partial tiles at the screen edge
+            // need no special handling -- the scissor clips them, which is
+            // most of what makes this simpler than the CPU version.
+            v[0].u = u0;                  v[0].v = v0;
+            v[0].x = (s16)sx;             v[0].y = (s16)sy;             v[0].z = 0;
+            v[1].u = u1;                  v[1].v = v1;
+            v[1].x = (s16)(sx + TILE_SIZE); v[1].y = (s16)(sy + TILE_SIZE); v[1].z = 0;
+        }
+    }
+
+    const int32 used = gu_tile_vert_count - firstVert;
+    if (!used)
+        return true; // nothing visible; still "handled"
+
+    GU_DrainQueueIfFull();
+    GUQueueEntry *e         = &gu_draw_queue[gu_draw_queue_count++];
+    e->type                 = GU_ENTRY_TILEBATCH;
+    e->tileBatch.firstVert  = firstVert;
+    e->tileBatch.vertCount  = used;
+    // BASIC always uses fullPalette[0]; HSCROLL uses the bank just verified
+    // to be uniform across the layer's scanlines.
+    e->tileBatch.bank       = (layer->type == LAYER_BASIC) ? 0 : bank;
+    e->tileBatch.screenSnapshot = *currentScreen;
+    return true;
+}
 void RSDK::GU_QueueLayerDraw(TileLayer *layer)
 {
 #if GU_BYPASS_DRAW_QUEUE
@@ -984,6 +1279,14 @@ void RSDK::GU_QueueLayerDraw(TileLayer *layer)
 #endif
 
     GU_DrainQueueIfFull();
+
+#if GU_GPU_TILES
+    // Eligible layers go to the GE instead of being queued for the CPU
+    // rasterizer. Anything it declines -- ROTOZOOM, per-scanline palette
+    // banks, no atlas, no room -- falls through to the path below.
+    if (GU_TryQueueLayerGPU(layer))
+        return;
+#endif
 
     GULayerEntry *le    = &gu_layer_queue[gu_layer_queue_count];
     le->layer           = layer;
@@ -1290,6 +1593,13 @@ void GU_QueueCircleOutlineDraw(int32 x, int32 y, int32 innerRadius, int32 outerR
 // deferred to one place.
 void GU_FlushDrawQueue()
 {
+#if GU_GPU_TILES
+    // Re-issuing CLOAD for an already-loaded CLUT within one list corrupts the
+    // texture alpha of every batch after the first: RGB still resolves, but the
+    // alpha test then rejects every texel and the layer vanishes. Load it once
+    // per flush and skip it while the bank is unchanged.
+    gu_clutLoadedBank = -1;
+#endif
     // Each entry carries the ScreenInfo `currentScreen` (see
     // GUSpriteEntry::screen) and, where relevant, the gfxLineBuffer[]
     // palette-bank snapshot (see GUSpriteEntry::lineBuffer) captured at
@@ -1398,6 +1708,17 @@ void GU_FlushDrawQueue()
                 break;
             }
 #endif
+#if GU_GPU_TILES
+            case GU_ENTRY_TILEBATCH: {
+                // Consecutive tile batches share one VRAM round trip.
+                int32 last = i;
+                while (last + 1 < gu_draw_queue_count && gu_draw_queue[last + 1].type == GU_ENTRY_TILEBATCH)
+                    ++last;
+                GU_DrawTileBatchRun(i, last - i + 1);
+                i = last;
+                break;
+            }
+#endif
             case GU_ENTRY_CIRCLE: {
                 GUCircleEntry *c          = &e->circle;
                 ScreenInfo snapshotScreen = c->screenSnapshot;
@@ -1434,6 +1755,7 @@ void GU_FlushDrawQueue()
         gu_queuePeak = gu_draw_queue_count;
 
     gu_face_vert_count   = 0;
+    gu_tile_vert_count   = 0;
     gu_draw_queue_count  = 0;
     gu_layer_queue_count = 0;
 }
@@ -1668,6 +1990,517 @@ static void GU_DrawFaceBatch(int32 firstVert, int32 vertCount)
         gu_faceTriCount += vertCount / 3;
     }
 }
+
+static void GU_BuildTileAtlas()
+{
+    if (!gu_tile_atlas)
+        return;
+
+    for (int32 t = 0; t < TILE_COUNT; ++t) {
+        const u8 *src = &tilesetPixels[TILE_DATASIZE * t];
+        u8 *dst       = gu_tile_atlas + ((t / GU_ATLAS_TILES_ROW) * TILE_SIZE) * GU_ATLAS_DIM
+                        + (t % GU_ATLAS_TILES_ROW) * TILE_SIZE;
+        for (int32 row = 0; row < TILE_SIZE; ++row) {
+            memcpy(dst, src, TILE_SIZE);
+            src += TILE_SIZE;
+            dst += GU_ATLAS_DIM;
+        }
+    }
+
+
+    // Did the source tileset and the packed atlas actually contain
+    // anything? A uniform on-screen colour means every texel read as
+    // the same index, so check both ends of the copy.
+    {
+        int32 srcNonZero = 0, dstNonZero = 0;
+        for (int32 i = 0; i < TILE_COUNT * TILE_DATASIZE; i += 7)
+            if (tilesetPixels[i]) ++srcNonZero;
+        for (int32 i = 0; i < GU_ATLAS_DIM * GU_ATLAS_DIM; i += 7)
+            if (gu_tile_atlas[i]) ++dstNonZero;
+        FILE *af = fopen("atlas_dbg.log", "a");
+        if (af) {
+            fprintf(af, "scene=%d atlas=%p  tileset nonzero=%d  atlas nonzero=%d (sampled 1/7)\n",
+                    (int)sceneInfo.listPos, (void *)gu_tile_atlas, (int)srcNonZero, (int)dstNonZero);
+            fclose(af);
+        }
+    }
+    sceKernelDcacheWritebackInvalidateAll();
+    gu_tile_atlas_ok = 1;
+}
+
+// Emits the GE commands that bind the atlas as an 8-bit CLUT texture.
+// Appended to a list already in progress.
+static void GU_EmitTileTextureState(int32 bank)
+{
+    // CLUT for this palette bank, built with the same 5551 conversion the
+    // sprite path uses -- index 0 gets alpha 0, which is RSDK's transparent.
+    uint16 *pal = fullPalette[bank];
+    for (int32 i = 0; i < 256; ++i) {
+        const uint16 c = pal[i];
+        const uint16 r5 = c & 0x1F, g6 = (c >> 5) & 0x3F, b5 = (c >> 11) & 0x1F;
+        gu_clut[i] = r5 | ((g6 >> 1) << 5) | (b5 << 10) | (i == 0 ? 0 : (1 << 15));
+    }
+    sceKernelDcacheWritebackRange(gu_clut, sizeof(gu_clut));
+
+    // NOT the uncached alias. CBPH is a 4-bit field holding address bits
+    // 24-27 (pspsdk: (cbp >> 8) & 0xf0000), so 0x4B... truncates to 0x4 and
+    // the GE reads the CLUT from the wrong address -- every texel then
+    // resolves to entry 0, which is transparent, and the whole layer
+    // disappears. The writeback below is what keeps it coherent.
+    const u32 clutAddr  = (u32)gu_clut;
+    const u32 atlasAddr = (u32)gu_tile_atlas;         // already a VRAM address
+
+    GE_CMD(TME, 1);
+    GE_CMD(TPSM, 5);   // GU_PSM_T8
+    GE_CMD(TMODE, 0);  // no mipmaps, not swizzled
+    GE_CMD(TBP0, atlasAddr & 0x00FFFFFF);
+    GE_CMD(TBW0, ((atlasAddr & 0xFF000000) >> 8) | GU_ATLAS_DIM);
+    GE_CMD(TSIZE0, (9 << 8) | 9); // 2^9 x 2^9 = 512x512
+
+    GE_CMD(CBP, clutAddr & 0x00FFFFFF);
+    GE_CMD(CBPH, (clutAddr >> 8) & 0x000F0000);
+    // psm | (shift << 2) | (mask << 8) | (start << 16). The mask is NOT
+    // optional: passing 0 ANDs every index to zero, so the whole texture
+    // samples CLUT entry 0 and comes out a flat colour.
+    GE_CMD(CMODE, 1 | (0 << 2) | (0xFF << 8) | (0 << 16)); // 5551, mask 0xFF
+    GE_CMD(CLOAD, 256 / 8);     // blocks of 8 entries
+
+    // NEAREST, never linear: bilinear on an indexed texture blends palette
+    // indices before the lookup, which is meaningless -- that was confirmed
+    // the first time GPU sprites were attempted.
+    GE_CMD(TFLT, 0);
+    GE_CMD(TWRAP, 0);           // clamp both axes
+    GE_CMD(TFUNC, 3 | (1 << 8)); // GU_TFX_REPLACE, RGBA -- these vertices have
+                                 // no colour component, so MODULATE would
+                                 // multiply the texture by the current
+                                 // primitive colour and come out black.
+    GE_CMD(TFLUSH, 0);
+    GE_CMD(TSYNC, 0);
+}
+
+#if GU_GPU_TILES
+static GUTexVertex __attribute__((aligned(16))) gu_atlas_test_verts[2];
+
+// Draws the atlas 1:1 at the screen origin. If the tileset appears as a grid
+// of tiles in the right colours, then texture upload, CLUT and sampling are
+// all correct -- before any layer geometry is involved.
+static void GU_DrawTileAtlasTest()
+{
+    if (!gu_tile_atlas_ok)
+        return;
+
+    const u32 pitch    = screens[0].pitch;
+    const size_t bytes = (size_t)MANIA_HEIGHT * pitch * sizeof(u16);
+
+    int32 bank = 0;
+    GU_PaletteUniform(0, MANIA_HEIGHT, &bank);
+
+    gu_atlas_test_verts[0].u = 0;   gu_atlas_test_verts[0].v = 0;
+    gu_atlas_test_verts[0].x = 0;   gu_atlas_test_verts[0].y = 0;   gu_atlas_test_verts[0].z = 0;
+    gu_atlas_test_verts[1].u = MANIA_WIDTH; gu_atlas_test_verts[1].v = MANIA_HEIGHT;
+    gu_atlas_test_verts[1].x = MANIA_WIDTH; gu_atlas_test_verts[1].y = MANIA_HEIGHT; gu_atlas_test_verts[1].z = 0;
+
+    sceKernelDcacheWritebackInvalidateAll();
+    sceDmacMemcpy(gu_3d_scratch, screen_pixels, bytes);
+
+    const u32 target = (u32)gu_3d_scratch | 0x40000000;
+
+    u32 *saved_ptr = ge_cmd_ptr;
+    ge_cmd_ptr     = ge_tri_cmd;
+
+    GE_CMD(FBP, target & 0x00FFFFFF);
+    GE_CMD(FBW, ((target & 0xFF000000) >> 8) | pitch);
+
+    GE_CMD(ABE, 0);
+    GE_CMD(ZTE, 0);
+    GE_CMD(ZMSK, 1);
+    GE_CMD(CULLE, 0);
+    GE_CMD(SHADE, 0); // flat -- colour comes from the texture
+
+    // Index 0 is transparent; the CLUT gives it alpha 0, so alpha-test it out.
+    // (alpha test deliberately not enabled in the verification draw)
+
+    GE_CMD(SCISSOR1, 0);
+    GE_CMD(SCISSOR2, ((MANIA_HEIGHT - 1) << 10) | (MANIA_WIDTH - 1));
+
+
+    GU_EmitTileTextureState(bank);
+
+    // Texture coords in texels (through mode), position 16-bit, 2D.
+    GE_CMD(VTYPE, (1 << 23) | (2 << 7) | 2);
+    GE_CMD(BASE, ((u32)gu_atlas_test_verts & 0xFF000000) >> 8);
+    GE_CMD(VADDR, (u32)gu_atlas_test_verts & 0x00FFFFFF);
+    GE_CMD(PRIM, (6 << 16) | 2); // GU_SPRITES, 2 verts
+
+    // Restore what the present quad assumes.
+    GE_CMD(ATE, 0);
+    GE_CMD(TFLT, 1); // present quad uses GU_LINEAR
+    GE_CMD(SCISSOR1, 0);
+    GE_CMD(SCISSOR2, (PSP_SCREEN_HEIGHT << 10) | PSP_SCREEN_WIDTH);
+    GE_CMD(TFLUSH, 0);
+
+    GE_CMD(FINISH, 0);
+    GE_CMD(END, 0);
+
+    ge_cmd_ptr = saved_ptr;
+
+    sceKernelDcacheWritebackRange(ge_tri_cmd, sizeof(ge_tri_cmd));
+    sceKernelDcacheWritebackRange(gu_atlas_test_verts, sizeof(gu_atlas_test_verts));
+
+    const int qid = sceGeListEnQueue(ge_tri_cmd, NULL, gecbid, NULL);
+    if (qid >= 0)
+        sceGeListSync(qid, 0);
+
+    sceDmacMemcpy(screen_pixels, gu_3d_scratch, bytes);
+    sceKernelDcacheWritebackInvalidateAll();
+}
+#endif
+
+#if GU_GPU_TILES
+// Draws one batch of tile quads. Same VRAM round trip as the face batch: the
+// GE cannot render into main RAM, so the frame goes out, gets drawn on, and
+// comes back.
+
+// Draws a run of consecutive queued tile batches through a single VRAM round
+// trip. The round trip is the entire cost of this path -- measured at GHZ1 it
+// is 3.83ms of DMA against 0.08ms of actual GE work -- so doing one per batch
+// made the GPU path slower than the CPU rasterizer it replaced. Batch state
+// (scissor, palette, texture) is per-batch inside the one list.
+static void GU_DrawTileBatchRun(int32 firstEntry, int32 entryCount)
+{
+    if (entryCount <= 0 || !gu_tile_atlas_ok)
+        return;
+
+    const u32 pitch    = screens[0].pitch;
+    const size_t bytes = (size_t)MANIA_HEIGHT * pitch * sizeof(u16);
+
+    const SceUInt64 t0 = gu_profilingEnabled ? sceKernelGetSystemTimeWide() : 0;
+
+    sceKernelDcacheWritebackInvalidateAll();
+    sceDmacMemcpy(gu_3d_scratch, screen_pixels, bytes);
+
+    const SceUInt64 t1 = gu_profilingEnabled ? sceKernelGetSystemTimeWide() : 0;
+
+    const u32 target = (u32)gu_3d_scratch | 0x40000000;
+
+    u32 *saved_ptr = ge_cmd_ptr;
+    ge_cmd_ptr     = ge_tri_cmd;
+
+    GE_CMD(FBP, target & 0x00FFFFFF);
+    GE_CMD(FBW, ((target & 0xFF000000) >> 8) | pitch);
+
+    GE_CMD(ABE, 0);
+    GE_CMD(ZTE, 0);
+    GE_CMD(ZMSK, 1);
+    GE_CMD(CULLE, 0);
+    GE_CMD(SHADE, 0);
+    GE_CMD(ATE, 1);
+    GE_CMD(ATST, (GU_GREATER) | (0 << 8) | (0xFF << 16)); // index 0 is transparent
+
+    int32 drawn = 0;
+    for (int32 k = 0; k < entryCount; ++k) {
+        const GUTileBatchEntry *tb = &gu_draw_queue[firstEntry + k].tileBatch;
+        if (tb->vertCount < 2)
+            continue;
+
+        const GUTexVertex *verts = &gu_tile_verts[tb->firstVert];
+
+        GE_CMD(SCISSOR1, (tb->screenSnapshot.clipBound_Y1 << 10) | tb->screenSnapshot.clipBound_X1);
+        GE_CMD(SCISSOR2, ((tb->screenSnapshot.clipBound_Y2 - 1) << 10) | (tb->screenSnapshot.clipBound_X2 - 1));
+
+        GU_EmitTileTextureState(tb->bank);
+
+        GE_CMD(VTYPE, (1 << 23) | (2 << 7) | 2);
+        GE_CMD(BASE, ((u32)verts & 0xFF000000) >> 8);
+        GE_CMD(VADDR, (u32)verts & 0x00FFFFFF);
+        GE_CMD(PRIM, (6 << 16) | tb->vertCount);
+
+        sceKernelDcacheWritebackRange((void *)verts, sizeof(GUTexVertex) * tb->vertCount);
+        ++drawn;
+
+        if (gu_profilingEnabled) {
+            gu_tileBatchCount++;
+            gu_tileQuadCount += tb->vertCount / 2;
+        }
+    }
+
+    // Put back what FlipScreen's present list assumes but never sets itself.
+    GE_CMD(ATE, 0);
+    GE_CMD(TFLT, 1);
+    GE_CMD(TFUNC, 3 | (1 << 8));
+    GE_CMD(SCISSOR1, 0);
+    GE_CMD(SCISSOR2, (PSP_SCREEN_HEIGHT << 10) | PSP_SCREEN_WIDTH);
+    GE_CMD(TFLUSH, 0);
+
+    GE_CMD(FINISH, 0);
+    GE_CMD(END, 0);
+
+    ge_cmd_ptr = saved_ptr;
+
+    if (drawn) {
+        sceKernelDcacheWritebackRange(ge_tri_cmd, sizeof(ge_tri_cmd));
+        const int qid = sceGeListEnQueue(ge_tri_cmd, NULL, gecbid, NULL);
+        if (qid >= 0)
+            sceGeListSync(qid, 0);
+    }
+
+    const SceUInt64 t2 = gu_profilingEnabled ? sceKernelGetSystemTimeWide() : 0;
+
+    sceDmacMemcpy(screen_pixels, gu_3d_scratch, bytes);
+    sceKernelDcacheWritebackInvalidateAll();
+
+    if (gu_profilingEnabled) {
+        const SceUInt64 t3 = sceKernelGetSystemTimeWide();
+        gu_tileDmaUsec += (t1 - t0) + (t3 - t2);
+        gu_tileGeUsec += t2 - t1;
+    }
+}
+
+static void GU_DrawTileBatch(int32 firstVert, int32 vertCount, int32 bank)
+{
+    if (vertCount < 2 || !gu_tile_atlas_ok)
+        return;
+
+    const u32 pitch    = screens[0].pitch;
+    const size_t bytes = (size_t)MANIA_HEIGHT * pitch * sizeof(u16);
+
+    const SceUInt64 t0 = gu_profilingEnabled ? sceKernelGetSystemTimeWide() : 0;
+
+    sceKernelDcacheWritebackInvalidateAll();
+    sceDmacMemcpy(gu_3d_scratch, screen_pixels, bytes);
+
+    const SceUInt64 t1 = gu_profilingEnabled ? sceKernelGetSystemTimeWide() : 0;
+
+    const u32 target   = (u32)gu_3d_scratch | 0x40000000;
+    GUTexVertex *verts = &gu_tile_verts[firstVert];
+
+    u32 *saved_ptr = ge_cmd_ptr;
+    ge_cmd_ptr     = ge_tri_cmd;
+
+    GE_CMD(FBP, target & 0x00FFFFFF);
+    GE_CMD(FBW, ((target & 0xFF000000) >> 8) | pitch);
+
+    GE_CMD(ABE, 0);
+    GE_CMD(ZTE, 0);
+    GE_CMD(ZMSK, 1);
+    GE_CMD(CULLE, 0);
+    GE_CMD(SHADE, 0); // flat: colour comes entirely from the texture
+
+    // Tile index 0 is RSDK's transparent pixel and the CLUT gives it alpha 0,
+    // so alpha-test it away. Without this the empty parts of every tile would
+    // paint over whatever is behind the layer.
+    GE_CMD(ATE, 1); // DIAGNOSTIC: test enabled but comparison always passes
+    GE_CMD(ATST, (GU_GREATER) | (0 << 8) | (0xFF << 16)); // pass if alpha > 0
+
+    GE_CMD(SCISSOR1, (currentScreen->clipBound_Y1 << 10) | currentScreen->clipBound_X1);
+    GE_CMD(SCISSOR2, ((currentScreen->clipBound_Y2 - 1) << 10) | (currentScreen->clipBound_X2 - 1));
+
+    GU_EmitTileTextureState(bank);
+
+    GE_CMD(VTYPE, (1 << 23) | (2 << 7) | 2); // 2D, 16-bit pos, 16-bit texcoords
+    GE_CMD(BASE, ((u32)verts & 0xFF000000) >> 8);
+    GE_CMD(VADDR, (u32)verts & 0x00FFFFFF);
+    GE_CMD(PRIM, (6 << 16) | vertCount); // GU_SPRITES
+
+    // Put back what FlipScreen's present list assumes but never sets itself.
+    GE_CMD(ATE, 0);
+    GE_CMD(TFLT, 1); // present quad samples with GU_LINEAR
+    GE_CMD(TFUNC, 3 | (1 << 8));
+    GE_CMD(SCISSOR1, 0);
+    GE_CMD(SCISSOR2, (PSP_SCREEN_HEIGHT << 10) | PSP_SCREEN_WIDTH);
+    GE_CMD(TFLUSH, 0);
+
+    GE_CMD(FINISH, 0);
+    GE_CMD(END, 0);
+
+    ge_cmd_ptr = saved_ptr;
+
+    sceKernelDcacheWritebackRange(ge_tri_cmd, sizeof(ge_tri_cmd));
+    sceKernelDcacheWritebackRange(verts, sizeof(GUTexVertex) * vertCount);
+
+    const int qid = sceGeListEnQueue(ge_tri_cmd, NULL, gecbid, NULL);
+    if (qid >= 0)
+        sceGeListSync(qid, 0);
+
+    const SceUInt64 t2 = gu_profilingEnabled ? sceKernelGetSystemTimeWide() : 0;
+
+    sceDmacMemcpy(screen_pixels, gu_3d_scratch, bytes);
+    sceKernelDcacheWritebackInvalidateAll();
+
+    if (gu_profilingEnabled) {
+        const SceUInt64 t3 = sceKernelGetSystemTimeWide();
+        gu_tileDmaUsec += (t1 - t0) + (t3 - t2);
+        gu_tileGeUsec += t2 - t1;
+        gu_tileBatchCount++;
+        gu_tileQuadCount += vertCount / 2;
+    }
+}
+
+#endif
+#if GU_TILE_SELFTEST
+static GUTexVertex __attribute__((aligned(16))) gu_tile_test_verts[6];
+static GUFaceVertex __attribute__((aligned(16))) gu_ctrl_verts[2];
+
+// Draws ONE tile through the GE and diffs the result against what the CPU
+// rasterizer would have produced for the same tile.
+//
+// This exists because the layer output is visibly wrong and guessing at it
+// from screenshots has already cost two wrong fixes. The framebuffer is the
+// ground truth: compute the expected 16x16 block from tilesetPixels +
+// fullPalette, draw the same tile with the GE, read it back, and report
+// exactly how they differ. The failure pattern identifies the cause:
+//
+//   every pixel wrong, same way   -> CLUT / palette
+//   pixels from a different tile  -> texture coords or atlas layout
+//   block offset by N             -> vertex positions
+//   correct but striped           -> sampling / filter / stride
+static void GU_TileQuadSelfTest()
+{
+    static int32 done = 0;
+    // Deliberately does NOT require gu_tile_verts: that buffer belongs to the
+    // layer path, which is switched off while this diagnostic runs.
+    if (done || !gu_tile_atlas_ok)
+        return;
+
+    // Pick a tile with plenty of non-zero pixels so the comparison is
+    // meaningful rather than mostly-transparent.
+    int32 tile = -1;
+    for (int32 t = 1; t < TILE_COUNT && tile < 0; ++t) {
+        int32 nz = 0;
+        for (int32 i = 0; i < TILE_DATASIZE; ++i)
+            if (tilesetPixels[TILE_DATASIZE * t + i])
+                ++nz;
+        if (nz > 120)
+            tile = t;
+    }
+    if (tile < 0)
+        return;
+    done = 1;
+
+    const u32 pitch    = screens[0].pitch;
+    const size_t bytes = (size_t)MANIA_HEIGHT * pitch * sizeof(u16);
+    const int32 px = 64, py = 64;
+    const int32 bank = 0;
+
+    // Snapshot the destination block before the GE touches it.
+    static u16 before[TILE_SIZE][TILE_SIZE];
+    for (int32 r = 0; r < TILE_SIZE; ++r)
+        for (int32 c = 0; c < TILE_SIZE; ++c)
+            before[r][c] = screen_pixels[(py + r) * pitch + px + c];
+
+    const int32 au = (tile % GU_ATLAS_TILES_ROW) * TILE_SIZE;
+    const int32 av = (tile / GU_ATLAS_TILES_ROW) * TILE_SIZE;
+
+    // GU_SPRITES with 16-bit vertices does not rasterise here -- an
+    // untextured colour sprite in the same list did not draw either,
+    // while GU_TRIANGLES with the identical vertex format does (the 3D
+    // face path). So build two triangles per tile instead.
+    const s16 u0 = (s16)au, v0 = (s16)av;
+    const s16 u1 = (s16)(au + TILE_SIZE), v1 = (s16)(av + TILE_SIZE);
+    const s16 x0 = (s16)px, y0 = (s16)py;
+    const s16 x1 = (s16)(px + TILE_SIZE), y1 = (s16)(py + TILE_SIZE);
+    const s16 quad[6][5] = {
+        { u0, v0, x0, y0, 0 }, { u1, v0, x1, y0, 0 }, { u0, v1, x0, y1, 0 },
+        { u1, v0, x1, y0, 0 }, { u1, v1, x1, y1, 0 }, { u0, v1, x0, y1, 0 },
+    };
+    for (int32 k = 0; k < 6; ++k) {
+        gu_tile_test_verts[k].u = quad[k][0]; gu_tile_test_verts[k].v = quad[k][1];
+        gu_tile_test_verts[k].x = quad[k][2]; gu_tile_test_verts[k].y = quad[k][3];
+        gu_tile_test_verts[k].z = quad[k][4];
+    }
+
+    // Control quad at x=100: opaque red, no texture.
+    gu_ctrl_verts[0].color = 0xFF0000FF; gu_ctrl_verts[0].x = 100; gu_ctrl_verts[0].y = (s16)py; gu_ctrl_verts[0].z = 0; gu_ctrl_verts[0].pad = 0;
+    gu_ctrl_verts[1].color = 0xFF0000FF; gu_ctrl_verts[1].x = 116; gu_ctrl_verts[1].y = (s16)(py + TILE_SIZE); gu_ctrl_verts[1].z = 0; gu_ctrl_verts[1].pad = 0;
+
+    sceKernelDcacheWritebackInvalidateAll();
+    sceDmacMemcpy(gu_3d_scratch, screen_pixels, bytes);
+
+    const u32 target = (u32)gu_3d_scratch | 0x40000000;
+    u32 *saved_ptr   = ge_cmd_ptr;
+    ge_cmd_ptr       = ge_tri_cmd;
+
+    GE_CMD(FBP, target & 0x00FFFFFF);
+    GE_CMD(FBW, ((target & 0xFF000000) >> 8) | pitch);
+    GE_CMD(ABE, 0);
+    GE_CMD(ZTE, 0);
+    GE_CMD(ZMSK, 1);
+    GE_CMD(CULLE, 0);
+    GE_CMD(SHADE, 0);
+    GE_CMD(ATE, 1); // DIAGNOSTIC: test enabled but comparison always passes
+    GE_CMD(SCISSOR1, 0);
+    GE_CMD(SCISSOR2, ((MANIA_HEIGHT - 1) << 10) | (MANIA_WIDTH - 1));
+
+
+
+    GE_CMD(ATE, 0);
+    GE_CMD(TFLT, 1);
+    GE_CMD(TFUNC, 3 | (1 << 8));
+    GE_CMD(SCISSOR1, 0);
+    GE_CMD(SCISSOR2, (PSP_SCREEN_HEIGHT << 10) | PSP_SCREEN_WIDTH);
+    GE_CMD(TFLUSH, 0);
+    GE_CMD(FINISH, 0);
+    GE_CMD(END, 0);
+
+    ge_cmd_ptr = saved_ptr;
+    sceKernelDcacheWritebackRange(ge_tri_cmd, sizeof(ge_tri_cmd));
+    sceKernelDcacheWritebackRange(gu_tile_test_verts, sizeof(gu_tile_test_verts));
+    sceKernelDcacheWritebackRange(gu_ctrl_verts, sizeof(gu_ctrl_verts));
+
+    const int qid = sceGeListEnQueue(ge_tri_cmd, NULL, gecbid, NULL);
+    if (qid >= 0)
+        sceGeListSync(qid, 0);
+
+    sceDmacMemcpy(screen_pixels, gu_3d_scratch, bytes);
+    sceKernelDcacheWritebackInvalidateAll();
+
+    FILE *f = fopen("tilequad_dbg.log", "w");
+    if (!f)
+        return;
+
+    const uint16 *pal = fullPalette[bank];
+    fprintf(f, "tile=%d  atlas uv=(%d,%d)  screen=(%d,%d)  pitch=%d\n", (int)tile, (int)au, (int)av, (int)px, (int)py, (int)pitch);
+    fprintf(f, "clut addr=%08X  clut[%02X]=%04X  clut[0]=%04X  clut[1]=%04X\n",
+            (unsigned)(u32)gu_clut, (unsigned)tilesetPixels[TILE_DATASIZE * tile],
+            (unsigned)gu_clut[tilesetPixels[TILE_DATASIZE * tile]], (unsigned)gu_clut[0], (unsigned)gu_clut[1]);
+    fprintf(f, "pal[%02X]=%04X  before(0,0)=%04X\n",
+            (unsigned)tilesetPixels[TILE_DATASIZE * tile],
+            (unsigned)fullPalette[bank][tilesetPixels[TILE_DATASIZE * tile]], (unsigned)before[0][0]);
+    fprintf(f, "CONTROL untextured sprite at (100,%d): got=%04X (expect non-zero if GU_SPRITES works)\n\n",
+            (int)py, (unsigned)screen_pixels[(py + 4) * pitch + 104]);
+    fprintf(f, "atlas[0..7] = ");
+    for (int32 c = 0; c < 8; ++c)
+        fprintf(f, "%02X ", gu_tile_atlas[av * GU_ATLAS_DIM + au + c]);
+    fprintf(f, "\ntile [0..7] = ");
+    for (int32 c = 0; c < 8; ++c)
+        fprintf(f, "%02X ", tilesetPixels[TILE_DATASIZE * tile + c]);
+    fprintf(f, "\n\n");
+
+    int32 bad = 0, shown = 0;
+    for (int32 r = 0; r < TILE_SIZE; ++r) {
+        for (int32 c = 0; c < TILE_SIZE; ++c) {
+            const uint8 idx  = tilesetPixels[TILE_DATASIZE * tile + r * TILE_SIZE + c];
+            const uint16 exp = idx ? pal[idx] : before[r][c]; // index 0 is transparent
+            const uint16 got = screen_pixels[(py + r) * pitch + px + c];
+            if (exp != got) {
+                ++bad;
+                if (shown < 12) {
+                    // before[] included: got == before means the GE never
+                    // touched the pixel, which is a different fault from
+                    // drawing the wrong colour.
+                    fprintf(f, "  (%2d,%2d) idx=%02X  expected=%04X  got=%04X  before=%04X\n", (int)c, (int)r,
+                            (unsigned)idx, (unsigned)exp, (unsigned)got, (unsigned)before[r][c]);
+                    ++shown;
+                }
+            }
+        }
+    }
+    fprintf(f, "\nmismatched pixels: %d of %d\n", (int)bad, (int)(TILE_SIZE * TILE_SIZE));
+    fclose(f);
+}
+#endif
+#if GU_GPU_TILES
+#endif
 #endif
 
 #define get_screen_pixels()                                                 \
@@ -1836,6 +2669,11 @@ printf("Mania Pitch is %i",MANIA_PITCH);
       // Skip past the 3D scratch target, which sits directly after screen_texture.
       gu_tex_arena = (u8 *)screen_texture + screenTexBytes * 2;
 
+      // Tile atlas: 512x512 8-bit = 256KB off the front of the arena,
+      // which is otherwise unused while GPU sprite drawing is parked.
+      gu_tile_atlas = gu_tex_arena;
+      gu_tex_arena += (size_t)GU_ATLAS_DIM * GU_ATLAS_DIM;
+
       const size_t vramTotal   = 2 * 1024 * 1024;
       const size_t vramCached  = 0x04000000;
       const size_t usedBefore  = (size_t)((u8 *)gu_tex_arena - (u8 *)vramCached);
@@ -1861,6 +2699,7 @@ printf("Mania Pitch is %i",MANIA_PITCH);
       // Only ~764KB is free after init, so a bigger buffer starves later
       // allocations -- 147KB here was enough to fail Init outright.
       static const int32 wanted[] = { 6144, 4096, 3072, 2048 };
+      // (tile quad buffer allocated just below)
       for (uint32 i = 0; i < sizeof(wanted) / sizeof(wanted[0]); ++i) {
           gu_face_verts = (GUFaceVertex *)memalign(16, sizeof(GUFaceVertex) * wanted[i]);
           if (gu_face_verts) {
@@ -1869,6 +2708,18 @@ printf("Mania Pitch is %i",MANIA_PITCH);
           }
       }
 
+#if GU_GPU_TILES
+      {
+          static const int32 tileWanted[] = { GU_TILE_VERT_WANT, 3072, 2048 };
+          for (uint32 i = 0; i < sizeof(tileWanted) / sizeof(tileWanted[0]); ++i) {
+              gu_tile_verts = (GUTexVertex *)memalign(16, sizeof(GUTexVertex) * tileWanted[i]);
+              if (gu_tile_verts) {
+                  gu_tile_vert_max = tileWanted[i];
+                  break;
+              }
+          }
+      }
+#endif
       printf("RSDKv5 PSP: gpu face verts = %d (%d bytes), free mem = %d\n",
              (int)gu_face_vert_max, (int)(gu_face_vert_max * (int)sizeof(GUFaceVertex)),
              (int)sceKernelTotalFreeMemSize());
@@ -1932,6 +2783,68 @@ void RenderDevice::CopyFrameBuffer()
   // where the actual CPU pixel writes for the frame happen now that draws
   // are deferred (Stage 0), so it must run BEFORE the transfer below.
   GU_FlushDrawQueue();
+
+#if GU_GPU_TILES || GU_TILE_SELFTEST || GU_TILE_ATLAS_TEST
+  // Rebuild when the scene changes -- the tileset is per-stage. Cheap
+  // because it is once per scene, not per frame.
+  if (gu_atlas_scene != sceneInfo.listPos) {
+      gu_atlas_scene = sceneInfo.listPos;
+      GU_BuildTileAtlas();
+  }
+#endif
+#if GU_TILE_SELFTEST
+  GU_TileQuadSelfTest();
+#endif
+#if GU_FB_DUMP
+  {
+      static bool sceneListDumped = false;
+      if (!sceneListDumped) {
+          sceneListDumped = true;
+          FILE *sf = fopen("scenes.log", "w");
+          if (sf) {
+              fprintf(sf, "categoryCount=%d activeCategory=%d listPos=%d\n",
+                      (int)sceneInfo.categoryCount, (int)sceneInfo.activeCategory, (int)sceneInfo.listPos);
+              for (int32 c = 0; c < sceneInfo.categoryCount; ++c) {
+                  SceneListInfo *cat = &sceneInfo.listCategory[c];
+                  fprintf(sf, "cat %d '%s' start=%d count=%d\n",
+                          (int)c, cat->name, (int)cat->sceneOffsetStart, (int)cat->sceneCount);
+                  for (int32 e = 0; e < cat->sceneCount; ++e) {
+                      SceneListEntry *se = &sceneInfo.listData[cat->sceneOffsetStart + e];
+                      fprintf(sf, "    [%d] %s\n", (int)e, se->name);
+                  }
+              }
+              fclose(sf);
+          }
+      }
+  }
+#endif
+#if GU_FB_DUMP
+  {
+      static int32 fbDumpFrame = 0;
+      if (++fbDumpFrame == GU_FB_DUMP_AT) {
+          FILE *pf = fopen("fb.ppm", "wb");
+          if (pf) {
+              fprintf(pf, "P6\n%d %d\n255\n", (int)MANIA_WIDTH, (int)MANIA_HEIGHT);
+              for (int32 y = 0; y < MANIA_HEIGHT; ++y) {
+                  for (int32 x = 0; x < MANIA_WIDTH; ++x) {
+                      const uint16 c = screen_pixels[y * screens[0].pitch + x];
+                      // This port swapped the 565 channel order so red sits in
+                      // the low bits, matching PSP GU_PSM_5650.
+                      unsigned char rgb[3];
+                      rgb[0] = (unsigned char)(((c      ) & 0x1F) << 3);
+                      rgb[1] = (unsigned char)(((c >>  5) & 0x3F) << 2);
+                      rgb[2] = (unsigned char)(((c >> 11) & 0x1F) << 3);
+                      fwrite(rgb, 1, 3, pf);
+                  }
+              }
+              fclose(pf);
+          }
+      }
+  }
+#endif
+#if GU_TILE_ATLAS_TEST
+  GU_DrawTileAtlasTest();
+#endif
 
 #if GU_3D_TEST_TRIANGLE
   // Here, NOT at the end of GU_FlushDrawQueue. That function is no longer
@@ -2094,6 +3007,24 @@ static void GU_UpdateFPSCounter()
                         (double)gu_faceDmaUsec / 1000.0 / frameCount, (double)gu_faceGeUsec / 1000.0 / frameCount);
                 gu_faceDmaUsec = gu_faceGeUsec = 0;
                 gu_faceBatchCount = gu_faceTriCount = 0;
+                fprintf(h, "     layers: hscroll %5.2f  vscroll %5.2f  rotozoom %5.2f  basic %5.2f  |  bands/layer %5.1f\n",
+                        (double)gu_layerTypeUsec[0] / 1000.0 / frameCount, (double)gu_layerTypeUsec[1] / 1000.0 / frameCount,
+                        (double)gu_layerTypeUsec[2] / 1000.0 / frameCount, (double)gu_layerTypeUsec[3] / 1000.0 / frameCount,
+                        gu_layerBandSamples ? (double)gu_layerBands / gu_layerBandSamples : 0.0);
+                gu_layerTypeUsec[0] = gu_layerTypeUsec[1] = gu_layerTypeUsec[2] = gu_layerTypeUsec[3] = 0;
+                gu_layerBands = gu_layerBandSamples = 0;
+#if GU_GPU_TILES
+                fprintf(h, "     gpu tiles: %6.1f quads %4.1f batches  dma %5.2f  ge %5.2f  (per frame)\n",
+                        (double)gu_tileQuadCount / frameCount, (double)gu_tileBatchCount / frameCount,
+                        (double)gu_tileDmaUsec / 1000.0 / frameCount, (double)gu_tileGeUsec / 1000.0 / frameCount);
+                fprintf(h, "     tile declines: type %d atlas %d verts %d stale %d size %d clip %d xspan %d pal %d room %d\n",
+                        (int)gu_tile_decline[0], (int)gu_tile_decline[1], (int)gu_tile_decline[2],
+                        (int)gu_tile_decline[3], (int)gu_tile_decline[4], (int)gu_tile_decline[5],
+                        (int)gu_tile_decline[6], (int)gu_tile_decline[7], (int)gu_tile_decline[8]);
+                for (int32 di = 0; di < 9; ++di) gu_tile_decline[di] = 0;
+                gu_tileDmaUsec = gu_tileGeUsec = 0;
+                gu_tileBatchCount = gu_tileQuadCount = 0;
+#endif
 #endif
                 gu_queuePeak   = 0;
                 gu_queueDrains = 0;
