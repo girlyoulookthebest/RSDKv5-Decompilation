@@ -8,6 +8,14 @@
     PSP_MAIN_THREAD_ATTR(THREAD_ATTR_USER | THREAD_ATTR_VFPU);
     PSP_MAIN_THREAD_STACK_SIZE_KB(2048);
 
+    // NOTE: this port calls PSP_HEAP_SIZE_KB(-128) inside main(), where the
+    // macro expands to a declaration of an unused LOCAL and therefore does
+    // nothing -- the game runs on newlib default heap. That looks like a
+    // bug, but moving it to file scope so it takes effect is worse: -128
+    // means "all memory except 128KB", which starves everything allocated
+    // outside newlib (thread stacks, sceGuInit buffers, audio) and corrupts
+    // tile layers on the title screen. Left as-is deliberately.
+
 // HOME button support.
 //
 // The PSP only offers the quit prompt to an app that has registered an exit

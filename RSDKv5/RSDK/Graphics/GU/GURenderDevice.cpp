@@ -366,6 +366,7 @@ enum GUQueueEntryType {
     GU_ENTRY_ROTOZOOM,
     GU_ENTRY_FACE,
     GU_ENTRY_BLENDEDFACE,
+    GU_ENTRY_FACEBATCH,
     GU_ENTRY_CIRCLE,
     GU_ENTRY_CIRCLEOUTLINE
 };
@@ -494,6 +495,54 @@ struct GUBlendedFaceEntry {
     int32 vertCount, alpha, inkEffect;
 };
 
+
+// Gouraud 2D triangle vertex: GU_COLOR_8888 | GU_VERTEX_16BIT | GU_TRANSFORM_2D.
+//
+// The GE requires the vertex stride to be a multiple of its largest member,
+// so this is padded to 12 bytes rather than the 10 the fields occupy.
+// Component order is fixed by the hardware: colour first, then position.
+struct GUFaceVertex {
+    u32 color;      // 0xAABBGGRR -- red in the LOW byte, same order as the framebuffer
+    s16 x, y, z;
+    s16 pad;
+};
+
+// --- GPU face batching (Stage B) ----------------------------------------
+//
+// Set to 1 to route eligible 3D faces to the GE instead of the CPU
+// rasterizer. Off by default until it has been verified on hardware.
+#define GU_GPU_FACES 1
+
+// Vertices for one frame's GPU faces, expanded to triangles. Measured on
+// hardware, the Special Stage emits ~1760 faces/frame; at 3 verts each that
+// is ~5300, and quads expand to two triangles, so this has real headroom.
+// Anything beyond it falls back to the CPU rasterizer rather than dropping.
+// Allocated on the heap at Init, NOT as a static array. As 147KB of static
+// BSS this was enough to make the framebuffer allocation in Init fail on
+// hardware, and a failed Init exits the engine straight back to the XMB.
+// PPSSPP has a looser memory budget and booted fine, which hid it entirely.
+// Init tries progressively smaller sizes and disables the GPU path rather
+// than failing if none fit.
+static GUFaceVertex *gu_face_verts = NULL;
+static int32 gu_face_vert_max      = 0;
+static int32 gu_face_vert_count = 0;
+
+// Per-window profiling for the GPU face path.
+static SceUInt64 gu_faceDmaUsec = 0, gu_faceGeUsec = 0;
+static int32 gu_faceBatchCount = 0, gu_faceTriCount = 0;
+
+// A run of consecutive GPU faces, replayed as one GE draw. Consecutive
+// eligible faces extend the open batch rather than each taking a queue slot,
+// which is what keeps 1760 faces from overflowing a 2048-entry queue -- and
+// is the whole point, since one GE list replaces 1760 software rasterizes.
+//
+// The batch is closed as soon as any other draw is queued, so draw order is
+// preserved exactly: the HUD sprites drawn after the 3D still land on top.
+struct GUFaceBatchEntry {
+    ScreenInfo screenSnapshot;
+    int32 firstVert, vertCount;
+};
+
 // DrawCircle/DrawCircleOutline -- same clip-bound-drift vulnerability as
 // DrawFace (full ScreenInfo snapshot needed, not just a pointer). DrawCircle
 // specifically is what drives circular iris-wipe scene transitions -- left
@@ -528,12 +577,19 @@ struct GUQueueEntry {
         GURotoEntry roto;
         GUFaceEntry face;
         GUBlendedFaceEntry blendedFace;
+        GUFaceBatchEntry faceBatch;
         GUCircleEntry circle;
         GUCircleOutlineEntry circleOutline;
     };
 };
 
-#define GU_DRAW_QUEUE_MAX 2048
+// 2048 entries at 316 bytes each was 647KB of static BSS -- the single
+// largest allocation in the port, and it squeezed the newlib heap the game
+// uses for stage and tile-layer data. It only needed to be that big because
+// every 3D face took a slot; with faces batched, measured peak is 135.
+// Overflow is still handled correctly (GU_DrainQueueIfFull replays in order),
+// so this is a safety margin, not a hard limit.
+#define GU_DRAW_QUEUE_MAX 512
 static GUQueueEntry gu_draw_queue[GU_DRAW_QUEUE_MAX];
 static int32 gu_draw_queue_count = 0;
 
@@ -825,7 +881,11 @@ static void GU_SyncSpriteBatchIfActive()
 
 // Defined below, forward-declared so the queue functions can drain the queue
 // when it fills. See GU_DrainQueueIfFull.
+
 void GU_FlushDrawQueue();
+#if GU_GPU_FACES
+static void GU_DrawFaceBatch(int32 firstVert, int32 vertCount);
+#endif
 
 // What to do when a draw can't be queued -- either the queue is full, or the
 // entry is structurally unqueueable (a face with more verts than
@@ -1073,6 +1133,90 @@ void GU_QueueBlendedFaceDraw(Vector2 *vertices, uint32 *colors, int32 vertCount,
 
     GU_DrainQueueIfFull();
 
+#if GU_GPU_FACES
+    // Route to the GE when the face is a plain opaque triangle or quad.
+    //
+    // Anything with an ink effect or partial alpha still goes down the CPU
+    // path: those need the blend tables, and getting them onto the GE is a
+    // separate problem. Eligible faces are appended to the open batch so a
+    // whole run of them costs ONE queue slot and ONE GE draw, rather than
+    // 1760 slots and 1760 software rasterizes.
+    {
+        // One-shot: why faces are or are not eligible.
+        static int32 eligDone = 0;
+        if (!eligDone && gu_profilingEnabled) {
+            eligDone = 1;
+            FILE *ef = fopen("elig_dbg.log", "w");
+            if (ef) {
+                fprintf(ef, "first blended face: inkEffect=%d alpha=%d vertCount=%d\n", (int)inkEffect, (int)alpha, (int)vertCount);
+                fprintf(ef, "INK_NONE=%d INK_BLEND=%d INK_ALPHA=%d INK_ADD=%d INK_SUB=%d\n", (int)INK_NONE, (int)INK_BLEND, (int)INK_ALPHA, (int)INK_ADD, (int)INK_SUB);
+                fclose(ef);
+            }
+        }
+    }
+    // NOTE: alpha is deliberately NOT tested. For INK_NONE the CPU rasterizer
+    // ignores it and writes opaquely -- the game passes 0 here -- so requiring
+    // alpha >= 0xFF rejected every face in the game.
+    if (inkEffect == INK_NONE && (vertCount == 3 || vertCount == 4)) {
+        const int32 needed = (vertCount == 3) ? 3 : 6; // quads become two triangles
+        // Reject faces whose projected coordinates are out of range.
+        //
+        // Draw3DScene projects as (x << projectionX) / z, and z is only
+        // rejected below 0x100 -- so a vertex close to the camera can come
+        // out at tens of thousands of pixels. The CPU rasterizer clips that
+        // correctly; packing it into an s16 wraps it, and the GE's 2D
+        // coordinate space is narrower still, so the triangle lands
+        // somewhere arbitrary. Those faces go back to the CPU path, which
+        // clips properly -- it is a handful per frame, not a hot path.
+        int32 inRange = 1;
+        for (int32 i = 0; i < vertCount; ++i) {
+            const int32 px = vertices[i].x >> 16;
+            const int32 py = vertices[i].y >> 16;
+            if (px < -1024 || px > 2047 || py < -1024 || py > 2047) {
+                inRange = 0;
+                break;
+            }
+        }
+
+        if (inRange && gu_face_verts && gu_face_vert_count + needed <= gu_face_vert_max) {
+            // Extend the batch if the previous entry is one and is still the
+            // most recent -- otherwise any intervening draw would be
+            // reordered behind these faces.
+            GUQueueEntry *b = NULL;
+            if (gu_draw_queue_count > 0 && gu_draw_queue[gu_draw_queue_count - 1].type == GU_ENTRY_FACEBATCH)
+                b = &gu_draw_queue[gu_draw_queue_count - 1];
+            else {
+                b                          = &gu_draw_queue[gu_draw_queue_count++];
+                b->type                    = GU_ENTRY_FACEBATCH;
+                b->faceBatch.screenSnapshot = *currentScreen;
+                b->faceBatch.firstVert     = gu_face_vert_count;
+                b->faceBatch.vertCount     = 0;
+            }
+
+            // Screen-space already: Draw3DScene projects into 16.16 fixed
+            // point, so this is a shift, not a transform. Colours arrive as
+            // 0xRRGGBB and the GE wants 0xAABBGGRR -- red in the LOW byte,
+            // the same order the framebuffer uses.
+            static const int32 quadIdx[6] = { 0, 1, 2, 0, 2, 3 };
+            for (int32 i = 0; i < needed; ++i) {
+                const int32 s     = (vertCount == 3) ? i : quadIdx[i];
+                GUFaceVertex *v   = &gu_face_verts[gu_face_vert_count++];
+                const uint32 c    = colors[s];
+                v->color          = 0xFF000000u | ((c & 0xFF) << 16) | (c & 0xFF00) | ((c >> 16) & 0xFF);
+                v->x              = (s16)(vertices[s].x >> 16);
+                v->y              = (s16)(vertices[s].y >> 16);
+                v->z              = 0;
+                v->pad            = 0;
+            }
+            b->faceBatch.vertCount += needed;
+            return;
+        }
+        // Vertex buffer full -- fall through to the CPU path rather than
+        // dropping the face.
+    }
+#endif
+
+
     GUQueueEntry *e                  = &gu_draw_queue[gu_draw_queue_count++];
     e->type                          = GU_ENTRY_BLENDEDFACE;
     e->blendedFace.screenSnapshot    = *currentScreen;
@@ -1137,17 +1281,6 @@ void GU_QueueCircleOutlineDraw(int32 x, int32 y, int32 innerRadius, int32 outerR
 // The parked sprite attempt failed on exactly this layer and the batching
 // on top made it far harder to see. Keep at 0 unless bringing that up.
 #define GU_3D_TEST_TRIANGLE 0
-
-// Gouraud 2D triangle vertex: GU_COLOR_8888 | GU_VERTEX_16BIT | GU_TRANSFORM_2D.
-//
-// The GE requires the vertex stride to be a multiple of its largest member,
-// so this is padded to 12 bytes rather than the 10 the fields occupy.
-// Component order is fixed by the hardware: colour first, then position.
-struct GUFaceVertex {
-    u32 color;      // 0xAABBGGRR -- red in the LOW byte, same order as the framebuffer
-    s16 x, y, z;
-    s16 pad;
-};
 
 
 // Replays every queued entry in original order. Called once per frame from
@@ -1256,6 +1389,15 @@ void GU_FlushDrawQueue()
                 DrawBlendedFace_CPU(f->vertices, f->colors, f->vertCount, f->alpha, f->inkEffect);
                 break;
             }
+#if GU_GPU_FACES
+            case GU_ENTRY_FACEBATCH: {
+                GUFaceBatchEntry *fb      = &e->faceBatch;
+                ScreenInfo snapshotScreen = fb->screenSnapshot;
+                currentScreen             = &snapshotScreen;
+                GU_DrawFaceBatch(fb->firstVert, fb->vertCount);
+                break;
+            }
+#endif
             case GU_ENTRY_CIRCLE: {
                 GUCircleEntry *c          = &e->circle;
                 ScreenInfo snapshotScreen = c->screenSnapshot;
@@ -1291,6 +1433,7 @@ void GU_FlushDrawQueue()
     if (gu_draw_queue_count > gu_queuePeak)
         gu_queuePeak = gu_draw_queue_count;
 
+    gu_face_vert_count   = 0;
     gu_draw_queue_count  = 0;
     gu_layer_queue_count = 0;
 }
@@ -1442,6 +1585,87 @@ static void GU_Draw3DTestTriangleRaw()
                 fclose(df);
             }
         }
+    }
+}
+#endif
+#if GU_GPU_FACES
+// Draws one batch of GPU faces: the finished CPU frame goes out to VRAM, the
+// GE draws the triangles onto it there, and the result comes back.
+//
+// The round trip exists because the GE cannot render into main RAM at all
+// (see GU_Draw3DTestTriangleRaw for the evidence). It is per batch rather
+// than per frame because a batch is closed by any intervening CPU draw, and
+// those draws must see the GE's output -- but consecutive faces coalesce, so
+// a scene that draws its 3D in one run pays for exactly one round trip.
+static void GU_DrawFaceBatch(int32 firstVert, int32 vertCount)
+{
+    if (vertCount < 3)
+        return;
+
+    const u32 pitch    = screens[0].pitch;
+    const size_t bytes = (size_t)MANIA_HEIGHT * pitch * sizeof(u16);
+
+    const SceUInt64 t0 = gu_profilingEnabled ? sceKernelGetSystemTimeWide() : 0;
+
+    sceKernelDcacheWritebackInvalidateAll();
+    sceDmacMemcpy(gu_3d_scratch, screen_pixels, bytes);
+
+    const SceUInt64 t1 = gu_profilingEnabled ? sceKernelGetSystemTimeWide() : 0;
+
+    const u32 target = (u32)gu_3d_scratch | 0x40000000; // uncached VRAM alias
+    GUFaceVertex *verts = &gu_face_verts[firstVert];
+
+    u32 *saved_ptr = ge_cmd_ptr;
+    ge_cmd_ptr     = ge_tri_cmd;
+
+    GE_CMD(FBP, target & 0x00FFFFFF);
+    GE_CMD(FBW, ((target & 0xFF000000) >> 8) | pitch);
+
+    GE_CMD(TME, 0);
+    GE_CMD(ABE, 0);
+    GE_CMD(ATE, 0);
+    GE_CMD(ZTE, 0);
+    GE_CMD(ZMSK, 1);
+    GE_CMD(CULLE, 0); // faces arrive in both windings -- Draw3DScene depth-sorts
+    GE_CMD(SHADE, 1); // gouraud (0x50 -- 0x1C is GU_LIGHT1, see the note above)
+
+    GE_CMD(SCISSOR1, 0);
+    GE_CMD(SCISSOR2, ((MANIA_HEIGHT - 1) << 10) | (MANIA_WIDTH - 1));
+
+    GE_CMD(VTYPE, (1 << 23) | (2 << 7) | (7 << 2));
+    GE_CMD(BASE, ((u32)verts & 0xFF000000) >> 8);
+    GE_CMD(VADDR, (u32)verts & 0x00FFFFFF);
+    GE_CMD(PRIM, (3 << 16) | vertCount);
+
+    // Restore what FlipScreen's present list assumes but never sets.
+    GE_CMD(TME, 1);
+    GE_CMD(SCISSOR1, 0);
+    GE_CMD(SCISSOR2, (PSP_SCREEN_HEIGHT << 10) | PSP_SCREEN_WIDTH);
+    GE_CMD(TFLUSH, 0);
+
+    GE_CMD(FINISH, 0);
+    GE_CMD(END, 0);
+
+    ge_cmd_ptr = saved_ptr;
+
+    sceKernelDcacheWritebackRange(ge_tri_cmd, sizeof(ge_tri_cmd));
+    sceKernelDcacheWritebackRange(verts, sizeof(GUFaceVertex) * vertCount);
+
+    const int qid = sceGeListEnQueue(ge_tri_cmd, NULL, gecbid, NULL);
+    if (qid >= 0)
+        sceGeListSync(qid, 0);
+
+    const SceUInt64 t2 = gu_profilingEnabled ? sceKernelGetSystemTimeWide() : 0;
+
+    sceDmacMemcpy(screen_pixels, gu_3d_scratch, bytes);
+    sceKernelDcacheWritebackInvalidateAll();
+
+    if (gu_profilingEnabled) {
+        const SceUInt64 t3 = sceKernelGetSystemTimeWide();
+        gu_faceDmaUsec += (t1 - t0) + (t3 - t2);
+        gu_faceGeUsec += t2 - t1;
+        gu_faceBatchCount++;
+        gu_faceTriCount += vertCount / 3;
     }
 }
 #endif
@@ -1623,7 +1847,52 @@ printf("Mania Pitch is %i",MANIA_PITCH);
       gu_tex_arena_used = 0;
   }
 
+
   InitInputDevices();
+
+#if GU_GPU_FACES
+  // Heap-allocated last, so the framebuffer allocation above always wins
+  // if memory is tight. Falls back through smaller sizes and finally to
+  // the CPU rasterizer, rather than failing Init -- a failed Init drops
+  // straight back to the XMB with no diagnostic at all.
+  {
+      // Sized against measured need, not headroom: the Special Stage emits
+      // ~1760 faces/frame = ~5300 verts on hardware. 6144 covers that at 73KB.
+      // Only ~764KB is free after init, so a bigger buffer starves later
+      // allocations -- 147KB here was enough to fail Init outright.
+      static const int32 wanted[] = { 6144, 4096, 3072, 2048 };
+      for (uint32 i = 0; i < sizeof(wanted) / sizeof(wanted[0]); ++i) {
+          gu_face_verts = (GUFaceVertex *)memalign(16, sizeof(GUFaceVertex) * wanted[i]);
+          if (gu_face_verts) {
+              gu_face_vert_max = wanted[i];
+              break;
+          }
+      }
+
+      printf("RSDKv5 PSP: gpu face verts = %d (%d bytes), free mem = %d\n",
+             (int)gu_face_vert_max, (int)(gu_face_vert_max * (int)sizeof(GUFaceVertex)),
+             (int)sceKernelTotalFreeMemSize());
+
+      // Memory report. Gated on profiling -- a shipping build has no
+      // business writing to the memory stick every boot. Placed AFTER the
+      // allocation above, which is why it reports a real size.
+      if (gu_profilingEnabled) {
+          FILE *mf = fopen("mem_dbg.log", "w");
+          if (mf) {
+              const int32 freeMem = (int32)sceKernelTotalFreeMemSize();
+              fprintf(mf, "GU_GPU_FACES        = %d\n", (int)GU_GPU_FACES);
+              fprintf(mf, "free mem after init = %d bytes (%d KB)\n", (int)freeMem, (int)(freeMem / 1024));
+              fprintf(mf, "gpu face verts      = %d (%d bytes)\n", (int)gu_face_vert_max,
+                      (int)(gu_face_vert_max * (int)sizeof(GUFaceVertex)));
+              fprintf(mf, "framebuffer         = %d bytes at %p\n", (int)PRESENT_ALLOC_BYTES, (void *)screen_pixels);
+              fprintf(mf, "sizeof(GUQueueEntry)= %d, queue total = %d bytes\n", (int)sizeof(GUQueueEntry),
+                      (int)(sizeof(GUQueueEntry) * GU_DRAW_QUEUE_MAX));
+              fclose(mf);
+          }
+      }
+  }
+#endif
+
   if (!AudioDevice::Init())
   return false;
 
@@ -1819,6 +2088,13 @@ static void GU_UpdateFPSCounter()
                         (double)gu_profUsec[GU_ENTRY_CIRCLE] / 1000.0 / frameCount);
                 fprintf(h, "     queue: peak %4d / %d  drains %d  (drains > 0 means the frame exceeded the queue)\n", gu_queuePeak,
                         GU_DRAW_QUEUE_MAX, gu_queueDrains);
+#if GU_GPU_FACES
+                fprintf(h, "     gpu faces: %6.1f tri  %4.1f batches  dma %5.2f  ge %5.2f  (per frame)\n",
+                        (double)gu_faceTriCount / frameCount, (double)gu_faceBatchCount / frameCount,
+                        (double)gu_faceDmaUsec / 1000.0 / frameCount, (double)gu_faceGeUsec / 1000.0 / frameCount);
+                gu_faceDmaUsec = gu_faceGeUsec = 0;
+                gu_faceBatchCount = gu_faceTriCount = 0;
+#endif
                 gu_queuePeak   = 0;
                 gu_queueDrains = 0;
 
