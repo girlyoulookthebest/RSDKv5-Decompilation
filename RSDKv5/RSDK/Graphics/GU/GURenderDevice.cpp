@@ -11,11 +11,22 @@
 #include <cstdio>
 using namespace RSDK;
 
-// Row stride for the rasterizer surface: 16-pixel aligned, and the value the
-// present quad's TBW0 uses. Note that this is NOT a legal GE
-// frame-buffer-width for sceGuDrawBuffer, which only encodes 64-pixel
-// multiples -- anything rendering to this surface with the GE has to account
-// for that.
+// Row stride for the rasterizer surface, and the value the present quad's
+// TBW0 uses.
+//
+// 64-pixel aligned, NOT the engine's usual 16. sceGuDrawBuffer encodes the
+// frame-buffer width in 64-pixel multiples, so a 16-aligned stride (424 ->
+// 432) is not a legal GE render target at all -- the GE simply cannot draw
+// into this surface. Rounding to 64 instead (424 -> 448) makes it legal, at
+// a cost of 16 extra pixels of padding per row (~7.7KB total).
+//
+// SetScreenSize() applies the same 64-alignment for the GU render device, so
+// screens[0].pitch matches this; the two must agree or the rasterizers will
+// stride differently from the allocation and the present DMA.
+//
+// Only the stride changes -- the engine still draws 424x240, and the present
+// quad's texture coordinates come from MANIA_WIDTH/MANIA_HEIGHT, so the
+// visible image is unaffected by the padding.
 //
 // NOTE the outer parentheses -- they were missing, and it mattered.
 //
@@ -28,7 +39,7 @@ using namespace RSDK;
 // The pre-existing uses survived by luck: they either went through the
 // screens[0].pitch variable instead of this macro, or combined it with `|`,
 // which binds looser than `&` and so happened to group correctly.
-#define MANIA_PITCH (((MANIA_WIDTH) + 15) & 0xFFFFFFF0)
+#define MANIA_PITCH (((MANIA_WIDTH) + 63) & 0xFFFFFFC0)
 #define PSP_SCREEN_WIDTH 480
 #define PSP_SCREEN_HEIGHT 272
 #define PSP_LINE_SIZE 512
@@ -86,6 +97,31 @@ using namespace RSDK;
 #define GE_CMD_FINISH 0x0F
 #define GE_CMD_SIGNAL 0x0C
 #define GE_CMD_NOP    0x00
+// Render state opcodes, verified by disassembling libpspgu.a rather than from
+// memory. Only SHADE was ever wrong: 0x1C is GU_LIGHT1, so the original code
+// enabled a light every frame -- which is what left shading flat and put a
+// stray coloured rectangle on screen. NOTE sceGuEnable's jump table is laid
+// out in REVERSE address order; reading the luis by address instead gives a
+// mapping that is wrong for every entry.
+//
+// Needed by the 3D face list below. The present quad relies on
+// Init having set these once and never touches them, so anything the face
+// list changes it must also put back.
+#define GE_CMD_SHADE    0x50
+#define GE_CMD_CULLE    0x1D
+#define GE_CMD_TME      0x1E
+#define GE_CMD_ABE      0x21
+#define GE_CMD_ATE      0x22
+#define GE_CMD_ZTE      0x23
+#define GE_CMD_SCISSOR1 0xD4
+#define GE_CMD_SCISSOR2 0xD5
+#define GE_CMD_ZMSK     0xE7
+// Terminates a list. NOTE 0x0C, not 0x0B -- 0x0B is RET, and emitting it with
+// no matching CALL faults the GE hard enough to power the console off
+// (confirmed on hardware). GE_CMD_SIGNAL above is also 0x0C, i.e. it is really
+// END -- so the present quad has always been correctly terminated, and the
+// "missing END" this was originally added to fix never existed.
+#define GE_CMD_END      0x0C
 
 // Present-quad vertices, in main RAM and double-buffered.
 //
@@ -177,6 +213,19 @@ static int gu_presentListId = -1;
 // re-alias these to make GPU drawing work -- that reintroduces this cost.
 static u16 *screen_texture = (u16 *)(0x4000000 + (512 * 272 * 2));
 static u16 *current_screen_texture = (u16 *)(0x4000000 + (512 * 272 * 2));
+
+// VRAM scratch render target for GPU 3D faces.
+//
+// The GE cannot render into main RAM (pspsdk documents sceGuDrawBuffer's fbp
+// as a "VRAM pointer"; on hardware a main-RAM address is silently ignored and
+// the GE keeps its previous target). The rasterizer surface lives in main RAM
+// because CPU access to VRAM is far slower -- moving it there was the single
+// biggest win in the performance work -- so it cannot simply move back.
+//
+// Instead the frame makes a round trip through here: DMA out, GE draws, DMA
+// back. Sits immediately after screen_texture; at 448x240x2 that is 215040
+// bytes, leaving ~1.35MB of VRAM still free.
+static u16 *gu_3d_scratch = (u16 *)(0x4000000 + (512 * 272 * 2) + (448 * 240 * 2));
 static u16 *screen_pixels = NULL;
 static u32 screen_pitch = 424;
 
@@ -1079,6 +1128,28 @@ void GU_QueueCircleOutlineDraw(int32 x, int32 y, int32 innerRadius, int32 outerR
     e->circleOutline.inkEffect         = inkEffect;
 }
 
+// --- GPU 3D faces (Stage A: can the GE draw into our framebuffer at all) ---
+//
+// Set to 1 to draw one fixed test triangle at the end of every flush. This
+// exists to isolate ONE question -- can the GE render into the main-RAM
+// rasterizer surface, with the right address, stride, vertex format and
+// cache handling -- from all the batching/ordering logic that comes after.
+// The parked sprite attempt failed on exactly this layer and the batching
+// on top made it far harder to see. Keep at 0 unless bringing that up.
+#define GU_3D_TEST_TRIANGLE 0
+
+// Gouraud 2D triangle vertex: GU_COLOR_8888 | GU_VERTEX_16BIT | GU_TRANSFORM_2D.
+//
+// The GE requires the vertex stride to be a multiple of its largest member,
+// so this is padded to 12 bytes rather than the 10 the fields occupy.
+// Component order is fixed by the hardware: colour first, then position.
+struct GUFaceVertex {
+    u32 color;      // 0xAABBGGRR -- red in the LOW byte, same order as the framebuffer
+    s16 x, y, z;
+    s16 pad;
+};
+
+
 // Replays every queued entry in original order. Called once per frame from
 // CopyFrameBuffer(), after the CPU-side writeback. Stage 0: every entry is
 // a CPU-fallback replay, so this is equivalent to what used to happen
@@ -1213,6 +1284,7 @@ void GU_FlushDrawQueue()
     // until after submitting its own raw command list.
     GU_SyncSpriteBatchIfActive();
 
+
     currentScreen = realCurrentScreen;
     memcpy(gfxLineBuffer, realLineBuffer, SCREEN_YSIZE);
 
@@ -1230,6 +1302,149 @@ void GU_FlushDrawQueue()
 static void Ge_Finish_Callback(int id, void *arg)
 {
 }
+
+// --- GPU 3D faces, via the raw GE queue --------------------------------
+//
+// Built and submitted exactly like FlipScreen's present quad: raw GE command
+// words, sceGeListEnQueue, waited on by queue id. NOT sceGuStart/Finish/Sync.
+//
+// That distinction is the whole reason this works. Init() closes its setup
+// list and leaves none open, and the present path deliberately bypasses the
+// GU driver -- see the note in FlipScreen about its list machinery being
+// "exactly what black-screens when the sync is deferred". Every earlier
+// attempt here drove the GE through sceGu*() calls and corrupted the present
+// quad, which showed up as the title screen cropped into a corner.
+//
+// Own command buffer and pointer: ge_cmd_ptr belongs to FlipScreen, so this
+// saves and restores it rather than sharing.
+static u32 __attribute__((aligned(16))) ge_tri_cmd[64];
+static GUFaceVertex __attribute__((aligned(16))) ge_tri_verts[3];
+
+#if GU_3D_TEST_TRIANGLE
+// One obvious triangle, gouraud-shaded red/green/blue, drawn through a VRAM
+// scratch target.
+//
+// The GE CANNOT render into main RAM. pspsdk documents sceGuDrawBuffer's fbp
+// as a "VRAM pointer", and on hardware a main-RAM address is not rejected --
+// it is silently ignored, leaving the GE drawing into whatever VRAM target
+// was set previously. Measured directly rather than inferred: with FBP/FBW
+// pointing at screen_pixels, zero pixels changed in it while triangles were
+// visibly on screen. Every earlier failure here (flicker, repeats, banding)
+// was a symptom of that one fact.
+//
+// So the surface makes a round trip: the finished CPU frame is DMA'd out to
+// VRAM, the GE draws into it there, and the result comes back. Two ~215KB
+// sceDmacMemcpy transfers, well under a millisecond, against the ~11ms the
+// CPU currently spends rasterizing 3D faces.
+static void GU_Draw3DTestTriangleRaw()
+{
+    const u32 pitch    = screens[0].pitch;
+    const size_t bytes = (size_t)MANIA_HEIGHT * pitch * sizeof(u16);
+
+    // Colours are 0xAABBGGRR -- red in the LOW byte, matching the
+    // framebuffer's PSP-native channel order.
+    ge_tri_verts[0].color = 0xFF0000FF; ge_tri_verts[0].x = 60;  ge_tri_verts[0].y = 40;  // red
+    ge_tri_verts[1].color = 0xFF00FF00; ge_tri_verts[1].x = 200; ge_tri_verts[1].y = 60;  // green
+    ge_tri_verts[2].color = 0xFFFF0000; ge_tri_verts[2].x = 100; ge_tri_verts[2].y = 180; // blue
+    for (int32 i = 0; i < 3; ++i) { ge_tri_verts[i].z = 0; ge_tri_verts[i].pad = 0; }
+
+    // Snapshot a scanline through the middle of the triangle so the result
+    // can be confirmed in memory rather than from a photograph.
+    static u16 dbgRowBefore[512];
+    const int32 dbgY = 100; // triangle spans y=40..180
+    memcpy(dbgRowBefore, screen_pixels + (size_t)dbgY * pitch, pitch * sizeof(u16));
+
+    // Push the CPU's pixels out of the data cache before the DMA reads them.
+    // Whole-cache, not the range calls -- those were not reliably covering
+    // the 215KB surface and left the output banded.
+    sceKernelDcacheWritebackInvalidateAll();
+
+    // Hand the finished CPU frame to VRAM, where the GE can actually draw.
+    sceDmacMemcpy(gu_3d_scratch, screen_pixels, bytes);
+
+    const u32 target = (u32)gu_3d_scratch | 0x40000000; // uncached VRAM alias
+
+    u32 *saved_ptr = ge_cmd_ptr;
+    ge_cmd_ptr     = ge_tri_cmd;
+
+    GE_CMD(FBP, target & 0x00FFFFFF);
+    GE_CMD(FBW, ((target & 0xFF000000) >> 8) | pitch);
+
+    // Untextured, unblended, no depth, no culling. Culling in particular must
+    // stay off: Draw3DScene resolves visibility by sorting faces back to
+    // front, so triangles arrive in both windings.
+    GE_CMD(TME, 0);
+    GE_CMD(ABE, 0);
+    GE_CMD(ATE, 0);
+    GE_CMD(ZTE, 0);
+    GE_CMD(ZMSK, 1); // no depth buffer is ever established -- don't write one
+    GE_CMD(CULLE, 0);
+    GE_CMD(SHADE, 1); // gouraud
+
+    GE_CMD(SCISSOR1, 0);
+    GE_CMD(SCISSOR2, ((MANIA_HEIGHT - 1) << 10) | (MANIA_WIDTH - 1));
+
+    // Colour 8888 (7<<2), position 16-bit (2<<7), through/2D transform (1<<23).
+    GE_CMD(VTYPE, (1 << 23) | (2 << 7) | (7 << 2));
+    GE_CMD(BASE, ((u32)ge_tri_verts & 0xFF000000) >> 8);
+    GE_CMD(VADDR, (u32)ge_tri_verts & 0x00FFFFFF);
+    GE_CMD(PRIM, (3 << 16) | 3); // GU_TRIANGLES, 3 vertices
+
+    // Put back what FlipScreen's present list relies on but never sets.
+    GE_CMD(TME, 1);
+    GE_CMD(SCISSOR1, 0);
+    GE_CMD(SCISSOR2, (PSP_SCREEN_HEIGHT << 10) | PSP_SCREEN_WIDTH);
+    GE_CMD(TFLUSH, 0);
+
+    GE_CMD(FINISH, 0);
+    GE_CMD(END, 0);
+
+    const int32 cmdWords = (int32)(ge_cmd_ptr - ge_tri_cmd);
+    ge_cmd_ptr           = saved_ptr;
+
+    // The GE reads both of these straight out of memory.
+    sceKernelDcacheWritebackRange(ge_tri_cmd, sizeof(ge_tri_cmd));
+    sceKernelDcacheWritebackRange(ge_tri_verts, sizeof(ge_tri_verts));
+
+    const int qid = sceGeListEnQueue(ge_tri_cmd, NULL, gecbid, NULL);
+    if (qid >= 0)
+        sceGeListSync(qid, 0);
+
+    // Bring the composited result back, so the rest of the frame's CPU draws
+    // and the present DMA both see it.
+    sceDmacMemcpy(screen_pixels, gu_3d_scratch, bytes);
+    sceKernelDcacheWritebackInvalidateAll();
+
+    {
+        static int32 dbgDone = 0;
+        if (!dbgDone) {
+            dbgDone      = 1;
+            const u16 *r = screen_pixels + (size_t)dbgY * pitch;
+            FILE *df     = fopen("tri_dbg.log", "w");
+            if (df) {
+                fprintf(df, "scratch = %p   GE target = 0x%08X\n", (void *)gu_3d_scratch, (unsigned)target);
+                fprintf(df, "pitch = %d   list words = %d\n", (int)pitch, (int)cmdWords);
+                fprintf(df, "expected: ONE run near x=77..167\n\n");
+                int32 runs = 0, start = -1;
+                for (int32 x = 0; x <= (int32)pitch; ++x) {
+                    const int32 changed = (x < (int32)pitch) && (r[x] != dbgRowBefore[x]);
+                    if (changed && start < 0)
+                        start = x;
+                    else if (!changed && start >= 0) {
+                        ++runs;
+                        if (runs <= 16)
+                            fprintf(df, "run %2d: x=%3d..%3d len=%3d  first=0x%04X mid=0x%04X last=0x%04X\n", (int)runs, (int)start,
+                                    (int)(x - 1), (int)(x - start), (unsigned)r[start], (unsigned)r[(start + x - 1) / 2], (unsigned)r[x - 1]);
+                        start = -1;
+                    }
+                }
+                fprintf(df, "\ntotal runs on this scanline: %d\n", (int)runs);
+                fclose(df);
+            }
+        }
+    }
+}
+#endif
 
 #define get_screen_pixels()                                                 \
   screen_pixels                                                             \
@@ -1347,13 +1562,46 @@ printf("Mania Pitch is %i",MANIA_PITCH);
   // currentScreen->pitch.
   // Engine default stride (MANIA_PITCH). Not overridden -- see PRESENT_BUFFER_BYTES.
 
-  // 16-byte aligned for sceDmacMemcpy.
-  screen_pixels = (u16 *)memalign(16, PRESENT_ALLOC_BYTES);
+  // 64-byte aligned: 16 is enough for sceDmacMemcpy, but the GE also renders
+  // into this surface, and the dcache range calls that keep CPU and GE views
+  // coherent operate on whole 64-byte cache lines. With a merely 16-aligned
+  // base, the first and last lines of the range are only partially covered
+  // and are not invalidated -- so stale CPU pixels survive there and get
+  // written back over the GE's output. A cache line is 32 pixels wide, which
+  // is exactly why that showed up as a triangle sliced into 32px vertical
+  // bands, flickering as which lines happened to still be resident changed.
+  // PRESENT_ALLOC_BYTES is already a multiple of 64.
+  screen_pixels = (u16 *)memalign(64, PRESENT_ALLOC_BYTES);
   if (!screen_pixels)
     return false;
 
   memset(screen_pixels, 0, PRESENT_ALLOC_BYTES);
   screens[0].frameBuffer = screen_pixels;
+
+#if GU_3D_TEST_TRIANGLE
+  // What the GE is actually being handed. The test triangle rendering as ~7
+  // side-by-side copies squashed into a band points at a row stride of 64
+  // rather than 448 (448/64 == 7), so dump the real values rather than
+  // assume where that comes from.
+  {
+      FILE *df = fopen("gu_dbg.log", "w");
+      if (df) {
+          const u32 geTarget = (u32)screen_pixels | 0x40000000; // uncached alias, as handed to the GE
+          const u32 fbp      = geTarget & 0x00FFFFFF;
+          const u32 fbw      = ((geTarget & 0xFF000000) >> 8) | (u32)screens[0].pitch;
+          fprintf(df, "screen_pixels = %p\n", (void *)screen_pixels);
+          fprintf(df, "screens[0].pitch = %d\n", (int)screens[0].pitch);
+          fprintf(df, "screens[0].size  = %d x %d\n", (int)screens[0].size.x, (int)screens[0].size.y);
+          fprintf(df, "MANIA_PITCH = %d   MANIA_WIDTH = %d\n", (int)MANIA_PITCH, (int)MANIA_WIDTH);
+          fprintf(df, "PRESENT_BUFFER_BYTES = %u\n", (unsigned)PRESENT_BUFFER_BYTES);
+          fprintf(df, "screen_texture = %p\n", (void *)screen_texture);
+          fprintf(df, "GE FBP word = 0x%08X\n", (unsigned)fbp);
+          fprintf(df, "GE FBW word = 0x%08X  (low 16 = width = %u)\n", (unsigned)fbw, (unsigned)(fbw & 0xFFFF));
+          fprintf(df, "base 64-aligned: %s\n", (((u32)screen_pixels & 63) == 0) ? "yes" : "NO");
+          fclose(df);
+      }
+  }
+#endif
 
   // GU sprite texture arena: whatever VRAM is left after screen_texture,
   // minus a safety margin. Computed from real addresses/sizes rather than a
@@ -1361,7 +1609,8 @@ printf("Mania Pitch is %i",MANIA_PITCH);
   // change later.
   {
       const size_t screenTexBytes = (size_t)MANIA_HEIGHT * screens[0].pitch * sizeof(u16);
-      gu_tex_arena = (u8 *)screen_texture + screenTexBytes;
+      // Skip past the 3D scratch target, which sits directly after screen_texture.
+      gu_tex_arena = (u8 *)screen_texture + screenTexBytes * 2;
 
       const size_t vramTotal   = 2 * 1024 * 1024;
       const size_t vramCached  = 0x04000000;
@@ -1414,6 +1663,17 @@ void RenderDevice::CopyFrameBuffer()
   // where the actual CPU pixel writes for the frame happen now that draws
   // are deferred (Stage 0), so it must run BEFORE the transfer below.
   GU_FlushDrawQueue();
+
+#if GU_3D_TEST_TRIANGLE
+  // Here, NOT at the end of GU_FlushDrawQueue. That function is no longer
+  // called once per frame: every queue drain runs it, and so does each of
+  // DrawLine/DrawTile/DrawDeformedSprite/DrawDevString, which drain the
+  // queue before writing straight to the framebuffer. Drawing the test
+  // triangle there produced one copy per flush -- seven of them on the title
+  // screen. This spot runs exactly once per frame, after all CPU pixel work
+  // and before the surface is written back and DMA'd out.
+  GU_Draw3DTestTriangleRaw();
+#endif
 
   // The rasterizer's writes are sitting in the CPU data cache, so they have
   // to be written back before the DMA engine -- which reads memory directly,

@@ -385,7 +385,16 @@ void RSDK::SetScreenSize(uint8 screenID, uint16 width, uint16 height)
 
         screen->size.x   = width;
         screen->size.y   = height & 0xFFF0;
+#if RETRO_RENDERDEVICE_GU
+        // 64-pixel aligned rather than 16. sceGuDrawBuffer encodes the frame
+        // buffer width in 64-pixel multiples, so the GE cannot render into a
+        // 16-aligned surface at all -- and the 3D path draws into this same
+        // surface. Must stay in step with MANIA_PITCH in GU/GURenderDevice.cpp,
+        // which sizes the allocation and the present DMA.
+        screen->pitch    = (screen->size.x + 63) & 0xFFFFFFC0;
+#else
         screen->pitch    = (screen->size.x + 15) & 0xFFFFFFF0;
+#endif
         screen->center.x = screen->size.x >> 1;
         screen->center.y = screen->size.y >> 1;
 
