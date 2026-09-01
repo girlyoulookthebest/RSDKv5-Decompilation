@@ -532,6 +532,30 @@ struct GUFaceVertex {
 // was brought up with.
 #define GU_TILE_ATLAS_TEST 0
 #define GU_FB_DUMP    0
+#define GU_VRAM_BENCH 0
+
+// Rasterize straight into VRAM instead of main RAM. The GE cannot render into
+// main RAM, so every GPU batch previously copied the framebuffer up to VRAM
+// and back -- 1.3ms per round trip measured on hardware, against 0.67ms of
+// actual GE work. Measured on hardware (GU_VramWriteBench), CPU writes to VRAM
+// are FASTER than to main RAM (0.76x blit, 0.88x fill, 0.92x read-modify-
+// write), so the round trips go away and the software rasterizer gets quicker
+// too. Also returns ~212KB of main RAM, which is scarce here.
+#define GU_FB_IN_VRAM 1
+
+#if GU_FB_IN_VRAM
+#define GU_FPS_LOG "fps_vram.log"
+#else
+#define GU_FPS_LOG "fps_mainram.log"
+#endif
+
+#if GU_FB_IN_VRAM
+#define GU_FB_COPY_UP()   ((void)0)
+#define GU_FB_COPY_BACK() ((void)0)
+#else
+#define GU_FB_COPY_UP()   sceDmacMemcpy(gu_3d_scratch, screen_pixels, bytes)
+#define GU_FB_COPY_BACK() sceDmacMemcpy(screen_pixels, gu_3d_scratch, bytes)
+#endif
 #define GU_FB_DUMP_AT 600
 
 // Draws one tile through the GE and diffs it against the CPU result. Use this
@@ -1825,7 +1849,7 @@ static void GU_Draw3DTestTriangleRaw()
     sceKernelDcacheWritebackInvalidateAll();
 
     // Hand the finished CPU frame to VRAM, where the GE can actually draw.
-    sceDmacMemcpy(gu_3d_scratch, screen_pixels, bytes);
+    GU_FB_COPY_UP();
 
     const u32 target = (u32)gu_3d_scratch | 0x40000000; // uncached VRAM alias
 
@@ -1877,7 +1901,7 @@ static void GU_Draw3DTestTriangleRaw()
 
     // Bring the composited result back, so the rest of the frame's CPU draws
     // and the present DMA both see it.
-    sceDmacMemcpy(screen_pixels, gu_3d_scratch, bytes);
+    GU_FB_COPY_BACK();
     sceKernelDcacheWritebackInvalidateAll();
 
     {
@@ -1930,7 +1954,7 @@ static void GU_DrawFaceBatch(int32 firstVert, int32 vertCount)
     const SceUInt64 t0 = gu_profilingEnabled ? sceKernelGetSystemTimeWide() : 0;
 
     sceKernelDcacheWritebackInvalidateAll();
-    sceDmacMemcpy(gu_3d_scratch, screen_pixels, bytes);
+    GU_FB_COPY_UP();
 
     const SceUInt64 t1 = gu_profilingEnabled ? sceKernelGetSystemTimeWide() : 0;
 
@@ -1979,7 +2003,7 @@ static void GU_DrawFaceBatch(int32 firstVert, int32 vertCount)
 
     const SceUInt64 t2 = gu_profilingEnabled ? sceKernelGetSystemTimeWide() : 0;
 
-    sceDmacMemcpy(screen_pixels, gu_3d_scratch, bytes);
+    GU_FB_COPY_BACK();
     sceKernelDcacheWritebackInvalidateAll();
 
     if (gu_profilingEnabled) {
@@ -2101,7 +2125,7 @@ static void GU_DrawTileAtlasTest()
     gu_atlas_test_verts[1].x = MANIA_WIDTH; gu_atlas_test_verts[1].y = MANIA_HEIGHT; gu_atlas_test_verts[1].z = 0;
 
     sceKernelDcacheWritebackInvalidateAll();
-    sceDmacMemcpy(gu_3d_scratch, screen_pixels, bytes);
+    GU_FB_COPY_UP();
 
     const u32 target = (u32)gu_3d_scratch | 0x40000000;
 
@@ -2151,7 +2175,7 @@ static void GU_DrawTileAtlasTest()
     if (qid >= 0)
         sceGeListSync(qid, 0);
 
-    sceDmacMemcpy(screen_pixels, gu_3d_scratch, bytes);
+    GU_FB_COPY_BACK();
     sceKernelDcacheWritebackInvalidateAll();
 }
 #endif
@@ -2177,7 +2201,7 @@ static void GU_DrawTileBatchRun(int32 firstEntry, int32 entryCount)
     const SceUInt64 t0 = gu_profilingEnabled ? sceKernelGetSystemTimeWide() : 0;
 
     sceKernelDcacheWritebackInvalidateAll();
-    sceDmacMemcpy(gu_3d_scratch, screen_pixels, bytes);
+    GU_FB_COPY_UP();
 
     const SceUInt64 t1 = gu_profilingEnabled ? sceKernelGetSystemTimeWide() : 0;
 
@@ -2246,7 +2270,7 @@ static void GU_DrawTileBatchRun(int32 firstEntry, int32 entryCount)
 
     const SceUInt64 t2 = gu_profilingEnabled ? sceKernelGetSystemTimeWide() : 0;
 
-    sceDmacMemcpy(screen_pixels, gu_3d_scratch, bytes);
+    GU_FB_COPY_BACK();
     sceKernelDcacheWritebackInvalidateAll();
 
     if (gu_profilingEnabled) {
@@ -2267,7 +2291,7 @@ static void GU_DrawTileBatch(int32 firstVert, int32 vertCount, int32 bank)
     const SceUInt64 t0 = gu_profilingEnabled ? sceKernelGetSystemTimeWide() : 0;
 
     sceKernelDcacheWritebackInvalidateAll();
-    sceDmacMemcpy(gu_3d_scratch, screen_pixels, bytes);
+    GU_FB_COPY_UP();
 
     const SceUInt64 t1 = gu_profilingEnabled ? sceKernelGetSystemTimeWide() : 0;
 
@@ -2324,7 +2348,7 @@ static void GU_DrawTileBatch(int32 firstVert, int32 vertCount, int32 bank)
 
     const SceUInt64 t2 = gu_profilingEnabled ? sceKernelGetSystemTimeWide() : 0;
 
-    sceDmacMemcpy(screen_pixels, gu_3d_scratch, bytes);
+    GU_FB_COPY_BACK();
     sceKernelDcacheWritebackInvalidateAll();
 
     if (gu_profilingEnabled) {
@@ -2414,7 +2438,7 @@ static void GU_TileQuadSelfTest()
     gu_ctrl_verts[1].color = 0xFF0000FF; gu_ctrl_verts[1].x = 116; gu_ctrl_verts[1].y = (s16)(py + TILE_SIZE); gu_ctrl_verts[1].z = 0; gu_ctrl_verts[1].pad = 0;
 
     sceKernelDcacheWritebackInvalidateAll();
-    sceDmacMemcpy(gu_3d_scratch, screen_pixels, bytes);
+    GU_FB_COPY_UP();
 
     const u32 target = (u32)gu_3d_scratch | 0x40000000;
     u32 *saved_ptr   = ge_cmd_ptr;
@@ -2451,7 +2475,7 @@ static void GU_TileQuadSelfTest()
     if (qid >= 0)
         sceGeListSync(qid, 0);
 
-    sceDmacMemcpy(screen_pixels, gu_3d_scratch, bytes);
+    GU_FB_COPY_BACK();
     sceKernelDcacheWritebackInvalidateAll();
 
     FILE *f = fopen("tilequad_dbg.log", "w");
@@ -2508,6 +2532,81 @@ static void GU_TileQuadSelfTest()
 
 #define get_screen_pitch()                                                  \
   screen_pitch                                                              \
+
+#if GU_VRAM_BENCH
+// Whether the framebuffer can live in VRAM full-time depends entirely on how
+// fast the CPU can rasterize into it -- the GE renders there for free, but the
+// software rasterizer still writes most pixels. Measures the three access
+// shapes the rasterizer actually produces, against main RAM and VRAM, rather
+// than assuming VRAM is "about half speed".
+static void GU_VramWriteBench()
+{
+    const int32 pitch = (int32)screens[0].pitch;
+    const int32 w = MANIA_WIDTH, h = MANIA_HEIGHT;
+    const int32 reps = 8;
+
+    u16 *bufs[2]        = { screen_pixels, gu_3d_scratch };
+    const char *names[2] = { "main RAM", "VRAM    " };
+    SceUInt64 seq[2], scat[2], rmw[2];
+
+    for (int32 b = 0; b < 2; ++b) {
+        volatile u16 *p = bufs[b];
+        SceUInt64 t;
+
+        // 1. sequential span fill -- what layers and fillscreen do
+        t = sceKernelGetSystemTimeWide();
+        for (int32 r = 0; r < reps; ++r)
+            for (int32 y = 0; y < h; ++y) {
+                volatile u16 *row = p + y * pitch;
+                for (int32 x = 0; x < w; ++x)
+                    row[x] = (u16)(x + r);
+            }
+        sceKernelDcacheWritebackInvalidateAll();
+        seq[b] = sceKernelGetSystemTimeWide() - t;
+
+        // 2. scattered 16x16 blocks -- what sprite blitting does
+        t = sceKernelGetSystemTimeWide();
+        for (int32 r = 0; r < reps; ++r)
+            for (int32 n = 0; n < 400; ++n) {
+                const int32 sx = (n * 37) % (w - 16);
+                const int32 sy = (n * 53) % (h - 16);
+                for (int32 y = 0; y < 16; ++y) {
+                    volatile u16 *row = p + (sy + y) * pitch + sx;
+                    for (int32 x = 0; x < 16; ++x)
+                        row[x] = (u16)(x + y + r);
+                }
+            }
+        sceKernelDcacheWritebackInvalidateAll();
+        scat[b] = sceKernelGetSystemTimeWide() - t;
+
+        // 3. read-modify-write -- what the ink/alpha blend paths do
+        t = sceKernelGetSystemTimeWide();
+        for (int32 r = 0; r < reps; ++r)
+            for (int32 y = 0; y < h; ++y) {
+                volatile u16 *row = p + y * pitch;
+                for (int32 x = 0; x < w; ++x)
+                    row[x] = (u16)((row[x] >> 1) & 0x7BEF);
+            }
+        sceKernelDcacheWritebackInvalidateAll();
+        rmw[b] = sceKernelGetSystemTimeWide() - t;
+    }
+
+    FILE *bf = fopen("vram_bench.log", "w");
+    if (bf) {
+        fprintf(bf, "CPU write cost per full-screen pass (%dx%d, pitch %d), usec\n", (int)w, (int)h, (int)pitch);
+        fprintf(bf, "target        seq-fill   sprite-blit   read-mod-write\n");
+        for (int32 b = 0; b < 2; ++b)
+            fprintf(bf, "%s    %8d   %11d   %14d\n", names[b],
+                    (int)(seq[b] / reps), (int)(scat[b] / reps), (int)(rmw[b] / reps));
+        fprintf(bf, "\nratio VRAM/main: seq %.2fx  blit %.2fx  rmw %.2fx\n",
+                (double)seq[1] / (double)seq[0],
+                (double)scat[1] / (double)scat[0],
+                (double)rmw[1] / (double)rmw[0]);
+        fprintf(bf, "main=%p vram=%p\n", (void *)bufs[0], (void *)bufs[1]);
+        fclose(bf);
+    }
+}
+#endif
 
 bool RenderDevice::Init()
 {//This is just gpSP display code atm...
@@ -2628,9 +2727,17 @@ printf("Mania Pitch is %i",MANIA_PITCH);
   // is exactly why that showed up as a triangle sliced into 32px vertical
   // bands, flickering as which lines happened to still be resident changed.
   // PRESENT_ALLOC_BYTES is already a multiple of 64.
+#if GU_FB_IN_VRAM
+  // Same block the GE was already rendering into as scratch; now it is the
+  // framebuffer itself, so there is nothing to copy. Cache-line alignment
+  // still matters for the same reason described above, and a VRAM base is
+  // 64-byte aligned by construction.
+  screen_pixels = gu_3d_scratch;
+#else
   screen_pixels = (u16 *)memalign(64, PRESENT_ALLOC_BYTES);
   if (!screen_pixels)
     return false;
+#endif
 
   memset(screen_pixels, 0, PRESENT_ALLOC_BYTES);
   screens[0].frameBuffer = screen_pixels;
@@ -2667,7 +2774,7 @@ printf("Mania Pitch is %i",MANIA_PITCH);
   {
       const size_t screenTexBytes = (size_t)MANIA_HEIGHT * screens[0].pitch * sizeof(u16);
       // Skip past the 3D scratch target, which sits directly after screen_texture.
-      gu_tex_arena = (u8 *)screen_texture + screenTexBytes * 2;
+      gu_tex_arena = (u8 *)gu_3d_scratch + ((PRESENT_ALLOC_BYTES + 255) & ~(size_t)255);
 
       // Tile atlas: 512x512 8-bit = 256KB off the front of the arena,
       // which is otherwise unused while GPU sprite drawing is parked.
@@ -2742,6 +2849,10 @@ printf("Mania Pitch is %i",MANIA_PITCH);
           }
       }
   }
+#endif
+
+#if GU_VRAM_BENCH
+  GU_VramWriteBench();
 #endif
 
   if (!AudioDevice::Init())
@@ -2948,7 +3059,7 @@ static void GU_UpdateFPSCounter()
         double dlistMs    = (double)gu_objDrawListUsecAccum / 1000.0 / frameCount;
         double flipMs     = (double)gu_flipUsecAccum / 1000.0 / frameCount;
 #if GU_ENABLE_PROFILING
-        FILE *f           = fopen("fps.log", "w");
+        FILE *f           = fopen(GU_FPS_LOG, "w");
         if (f) {
             fprintf(f, "%.2f fps\n", fps);
             fprintf(f, "frame %.2f ms = compute %.2f + idle(vblank) %.2f\n", frameMs, frameMs - vblankMs, vblankMs);
