@@ -165,6 +165,13 @@ extern SceneInfo sceneInfo;
 
 extern uint8 tilesetPixels[TILESET_SIZE * 4];
 
+#if RETRO_RENDERDEVICE_GU
+// Declared here rather than beside the other GU entry points further down:
+// CopyTile() below calls it, and that sits above them.
+void GU_MarkTilesDirty(int32 first, int32 count);
+void GU_MarkAllTilesDirty();
+#endif
+
 void LoadSceneFolder();
 void LoadSceneAssets();
 void LoadTileConfig(char *filepath);
@@ -307,6 +314,10 @@ inline void CopyTile(uint16 dest, uint16 src, uint16 count)
             *destPixelsXY++ = *srcPixelsXY++;
         }
     }
+
+#if RETRO_RENDERDEVICE_GU
+    GU_MarkTilesDirty(dest, count);
+#endif
 }
 
 inline ScanlineInfo *GetScanlines() { return scanlines; }
@@ -323,6 +334,11 @@ void DrawLayerBasic(TileLayer *layer);
 #if RETRO_RENDERDEVICE_GU
 // PSP only: queues this layer's draw for the unified per-frame GU draw queue (see GU/GURenderDevice.cpp) instead of drawing it immediately.
 void GU_QueueLayerDraw(TileLayer *layer);
+// PSP only: the GE samples tiles from a repacked atlas, so it has to be told
+// when the engine rewrites tile pixels. Scanning the tileset to find out cost
+// ~2.5ms/frame (it streams all 256KB through cache); the engine already knows.
+void GU_MarkTilesDirty(int32 first, int32 count);
+void GU_MarkAllTilesDirty();
 #endif
 
 #if RETRO_REV0U

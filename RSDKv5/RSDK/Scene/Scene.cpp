@@ -1002,6 +1002,11 @@ void RSDK::LoadStageGIF(char *filepath)
             }
         }
 
+#if RETRO_RENDERDEVICE_GU
+        // A fresh tileset invalidates the whole atlas.
+        GU_MarkAllTilesDirty();
+#endif
+
         // Flip XY
         srcPixels = &tilesetPixels[(FLIP_Y * TILESET_SIZE)];
         dstPixels = &tilesetPixels[(FLIP_XY * TILESET_SIZE) + (TILE_SIZE - 1)];

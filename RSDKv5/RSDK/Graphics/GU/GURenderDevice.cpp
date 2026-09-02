@@ -583,14 +583,64 @@ struct GUFaceVertex {
 static u8 *gu_tile_atlas       = NULL;
 static int32 gu_tile_atlas_ok  = 0;
 static int32 gu_atlas_scene    = -1; // listPos the atlas was built for
+static uint8 gu_tile_dirty[TILE_COUNT];  // tiles the engine has rewritten
+static bool gu_atlas_all_dirty = true;
+static int32 gu_atlas_changed  = 0;
+
+void RSDK::GU_MarkTilesDirty(int32 first, int32 count)
+{
+    if (first < 0) { count += first; first = 0; }
+    if (first >= TILE_COUNT || count <= 0)
+        return;
+    if (first + count > TILE_COUNT)
+        count = TILE_COUNT - first;
+    memset(&gu_tile_dirty[first], 1, (size_t)count);
+}
+
+void RSDK::GU_MarkAllTilesDirty() { gu_atlas_all_dirty = true; }
+static int32 gu_atlas_frame    = -1; // frame the hash was last checked on
+static int32 gu_frameCounter   = 0;
+static void GU_BuildTileAtlas();
+
+// Sparse hash of the tileset. Rebuilding the atlas on scene change alone is
+// wrong: Mania loads tile graphics after the scene has started, so the atlas
+// was captured from a tileset that was still empty (74 non-zero samples of
+// ~37000) and never refreshed, leaving every tile transparent. Tileset loads
+// rewrite large regions, so a few hundred samples detect them reliably, and
+// this runs once per frame rather than per layer.
+
 // Why layers get refused by GU_TryQueueLayerGPU, indexed by reason. Every
 // refusal is silent otherwise, which makes "nothing went to the GE" and
 // "everything went to the GE and drew nothing" look identical from outside.
 static int32 gu_tile_decline[9] = { 0 };
+static FILE *gu_layerLog = NULL;
+static int32 gu_layerLogFrame = 0;
+// distinct per-scanline palette banks over the clip range, for diagnosis
+static int32 GU_BankSpread(int32 y, int32 h, int32 *firstBank, int32 *lastBank)
+{
+    uint8 seen[256]; int32 n = 0;
+    for (int32 i = 0; i < 256; ++i) seen[i] = 0;
+    for (int32 i = 0; i < h; ++i) {
+        const uint8 b = gfxLineBuffer[y + i];
+        if (!seen[b]) { seen[b] = 1; ++n; }
+    }
+    *firstBank = gfxLineBuffer[y];
+    *lastBank  = gfxLineBuffer[y + h - 1];
+    return n;
+}
 // Which palette bank the GE currently holds in its CLUT, reset each frame
 // because the present list runs in between and may leave anything loaded.
 static int32 gu_clutLoadedBank = -1;
-#define GU_DECLINE(n) do { ++gu_tile_decline[(n)]; return false; } while (0)
+#define GU_DECLINE(n) do { ++gu_tile_decline[(n)];                                        \
+    if (gu_layerLog) {                                                                     \
+        int32 fb_ = 0, lb_ = 0;                                                            \
+        const int32 ns_ = GU_BankSpread(currentScreen->clipBound_Y1,                       \
+            currentScreen->clipBound_Y2 - currentScreen->clipBound_Y1, &fb_, &lb_);        \
+        fprintf(gu_layerLog, "  CPU  type=%d draw=%d size=%dx%d reason=%d banks=%d(%d..%d)\n", \
+            (int)layer->type, (int)layer->drawGroup[0], (int)layer->xsize,                 \
+            (int)layer->ysize, (int)(n), (int)ns_, (int)fb_, (int)lb_);                    \
+    }                                                                                      \
+    return false; } while (0)
 
 // Textured 2D vertex: GU_TEXTURE_16BIT | GU_VERTEX_16BIT | GU_TRANSFORM_2D.
 // Component order is fixed by the hardware: texture coords, then position.
@@ -1182,12 +1232,16 @@ static bool GU_TryQueueLayerGPU(TileLayer *layer)
 {
     if (layer->type != LAYER_BASIC && layer->type != LAYER_HSCROLL)
         GU_DECLINE(0);
-    if (!gu_tile_atlas_ok)
-        GU_DECLINE(1);
     if (!gu_tile_verts)
         GU_DECLINE(2);
-    if (gu_atlas_scene != sceneInfo.listPos)
-        GU_DECLINE(3); // atlas still holds the previous stage's tileset
+    // Once per frame, before any quads are built, so the atlas always matches
+    // the tileset this frame is actually drawing with.
+    if (gu_atlas_frame != gu_frameCounter) {
+        gu_atlas_frame = gu_frameCounter;
+        GU_BuildTileAtlas(); // per-tile, so this is cheap when nothing changed
+    }
+    if (!gu_tile_atlas_ok)
+        GU_DECLINE(1); // atlas not built yet (no tileset loaded)
     if (!layer->xsize || !layer->ysize)
         GU_DECLINE(4);
     if (currentScreen->clipBound_X1 >= currentScreen->clipBound_X2 || currentScreen->clipBound_Y1 >= currentScreen->clipBound_Y2)
@@ -1212,9 +1266,9 @@ static bool GU_TryQueueLayerGPU(TileLayer *layer)
         for (int32 cy = clipY1 + 1; cy < clipY2; ++cy)
             if (scanlines[cy].position.x != x0)
                 GU_DECLINE(6);
-        if (!GU_PaletteUniform(clipY1, clipY2 - clipY1, &bank))
-            GU_DECLINE(7);
     }
+    if (!GU_PaletteUniform(clipY1, clipY2 - clipY1, &bank))
+        GU_DECLINE(7);
 
     const ScanlineInfo *scanline = &scanlines[clipY1];
     // The two layer types differ in where a row starts, and getting this
@@ -1293,6 +1347,13 @@ static bool GU_TryQueueLayerGPU(TileLayer *layer)
     }
 
     const int32 used = gu_tile_vert_count - firstVert;
+    if (gu_layerLog) {
+        int32 fb_ = 0, lb_ = 0;
+        const int32 ns_ = GU_BankSpread(clipY1, clipY2 - clipY1, &fb_, &lb_);
+        fprintf(gu_layerLog, "  GPU  type=%d draw=%d size=%dx%d bank=%d verts=%d banks=%d(%d..%d)\n",
+                (int)layer->type, (int)layer->drawGroup[0], (int)layer->xsize,
+                (int)layer->ysize, (int)bank, (int)used, (int)ns_, (int)fb_, (int)lb_);
+    }
     if (!used)
         return true; // nothing visible; still "handled"
 
@@ -1301,9 +1362,8 @@ static bool GU_TryQueueLayerGPU(TileLayer *layer)
     e->type                 = GU_ENTRY_TILEBATCH;
     e->tileBatch.firstVert  = firstVert;
     e->tileBatch.vertCount  = used;
-    // BASIC always uses fullPalette[0]; HSCROLL uses the bank just verified
-    // to be uniform across the layer's scanlines.
-    e->tileBatch.bank       = (layer->type == LAYER_BASIC) ? 0 : bank;
+    // The bank just verified to be uniform across this layer's scanlines.
+    e->tileBatch.bank       = bank;
     e->tileBatch.screenSnapshot = *currentScreen;
     return true;
 }
@@ -2027,27 +2087,50 @@ static void GU_DrawFaceBatch(int32 firstVert, int32 vertCount)
     }
 }
 
+// Repacks tilesetPixels into the 512x512 atlas, per tile rather than wholesale.
+// Green Hill animates tiles (waterfall, water surface), so the tileset contents
+// change every frame; repacking all 1024 tiles each time cost ~2.7ms/frame and
+// took the scene from 56fps to 47. Hashing one byte per row of each tile is
+// ~16k reads and copies only the tiles that actually changed, which is normally
+// a handful.
+//
+// Writes go through the uncached alias so the GE sees them with no cache
+// maintenance: a whole-cache flush per frame costs far more than these copies.
 static void GU_BuildTileAtlas()
 {
     if (!gu_tile_atlas)
         return;
 
+    u8 *const atlasU = (u8 *)((u32)gu_tile_atlas | 0x40000000);
+    int32 changed    = 0;
+
     for (int32 t = 0; t < TILE_COUNT; ++t) {
+        if (!gu_atlas_all_dirty && !gu_tile_dirty[t])
+            continue;
+        gu_tile_dirty[t] = 0;
+        ++changed;
+
         const u8 *src = &tilesetPixels[TILE_DATASIZE * t];
-        u8 *dst       = gu_tile_atlas + ((t / GU_ATLAS_TILES_ROW) * TILE_SIZE) * GU_ATLAS_DIM
-                        + (t % GU_ATLAS_TILES_ROW) * TILE_SIZE;
+
+        u8 *dst      = atlasU + ((t / GU_ATLAS_TILES_ROW) * TILE_SIZE) * GU_ATLAS_DIM
+                       + (t % GU_ATLAS_TILES_ROW) * TILE_SIZE;
+        const u8 *sp = src;
         for (int32 row = 0; row < TILE_SIZE; ++row) {
-            memcpy(dst, src, TILE_SIZE);
-            src += TILE_SIZE;
+            memcpy(dst, sp, TILE_SIZE);
+            sp += TILE_SIZE;
             dst += GU_ATLAS_DIM;
         }
     }
+
+    gu_atlas_all_dirty = false;
+    gu_tile_atlas_ok   = 1;
+    gu_atlas_changed   = changed;
 
 
     // Did the source tileset and the packed atlas actually contain
     // anything? A uniform on-screen colour means every texel read as
     // the same index, so check both ends of the copy.
-    {
+    if (changed > 64) {
         int32 srcNonZero = 0, dstNonZero = 0;
         for (int32 i = 0; i < TILE_COUNT * TILE_DATASIZE; i += 7)
             if (tilesetPixels[i]) ++srcNonZero;
@@ -2055,13 +2138,11 @@ static void GU_BuildTileAtlas()
             if (gu_tile_atlas[i]) ++dstNonZero;
         FILE *af = fopen("atlas_dbg.log", "a");
         if (af) {
-            fprintf(af, "scene=%d atlas=%p  tileset nonzero=%d  atlas nonzero=%d (sampled 1/7)\n",
-                    (int)sceneInfo.listPos, (void *)gu_tile_atlas, (int)srcNonZero, (int)dstNonZero);
+            fprintf(af, "scene=%d atlas=%p  tileset nonzero=%d  atlas nonzero=%d  tiles repacked=%d\n",
+                    (int)sceneInfo.listPos, (void *)gu_tile_atlas, (int)srcNonZero, (int)dstNonZero, (int)changed);
             fclose(af);
         }
     }
-    sceKernelDcacheWritebackInvalidateAll();
-    gu_tile_atlas_ok = 1;
 }
 
 // Emits the GE commands that bind the atlas as an 8-bit CLUT texture.
@@ -2904,16 +2985,20 @@ void RenderDevice::CopyFrameBuffer()
   // order, right here -- see GU_FlushDrawQueue() for why this has to be a
   // single contained pass rather than scattered individual draws. This is
   // where the actual CPU pixel writes for the frame happen now that draws
+  {
+      if (gu_layerLogFrame < 3) {
+          if (!gu_layerLog) gu_layerLog = fopen("layers.log", "w");
+          ++gu_layerLogFrame;
+          if (gu_layerLog) { fprintf(gu_layerLog, "--- frame %d scene=%d ---\n", (int)gu_layerLogFrame, (int)sceneInfo.listPos); fflush(gu_layerLog); }
+      } else if (gu_layerLog) { fclose(gu_layerLog); gu_layerLog = NULL; }
+  }
   // are deferred (Stage 0), so it must run BEFORE the transfer below.
   GU_FlushDrawQueue();
 
 #if GU_GPU_TILES || GU_TILE_SELFTEST || GU_TILE_ATLAS_TEST
   // Rebuild when the scene changes -- the tileset is per-stage. Cheap
   // because it is once per scene, not per frame.
-  if (gu_atlas_scene != sceneInfo.listPos) {
-      gu_atlas_scene = sceneInfo.listPos;
-      GU_BuildTileAtlas();
-  }
+  ++gu_frameCounter;
 #endif
 #if GU_TILE_SELFTEST
   GU_TileQuadSelfTest();

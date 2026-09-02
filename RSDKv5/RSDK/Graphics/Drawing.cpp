@@ -4571,6 +4571,10 @@ void RSDK::DrawAniTile(uint16 sheetID, uint16 tileIndex, uint16 srcX, uint16 src
             }
         }
 
+#if RETRO_RENDERDEVICE_GU
+        GU_MarkTilesDirty(tileIndex, cnt);
+#endif
+
         // FLIP_X
         uint8 *srcTilePixels = &tilesetPixels[tileIndex << 8];
         if (cnt * TILE_SIZE > 0) {
