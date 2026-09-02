@@ -552,9 +552,21 @@ struct GUFaceVertex {
 #if GU_FB_IN_VRAM
 #define GU_FB_COPY_UP()   ((void)0)
 #define GU_FB_COPY_BACK() ((void)0)
+// After the GE has drawn into the framebuffer, the CPU's cached copy of those
+// lines is stale. It must be DISCARDED, not written back: the rasterizer
+// dirtied those same lines earlier in the frame, and writing them back lays
+// stale CPU pixels back over what the GE just produced. That is harmless while
+// the GE renders into a separate scratch buffer and a DMA carries the result
+// back, but with the framebuffer resident in VRAM they are the same memory. A
+// cache line is 64 bytes = 32 pixels, which is the width of the bands it
+// produces.
+#define GU_FB_GE_DONE()   sceKernelDcacheInvalidateRange(screen_pixels, PRESENT_BUFFER_BYTES)
 #else
 #define GU_FB_COPY_UP()   sceDmacMemcpy(gu_3d_scratch, screen_pixels, bytes)
 #define GU_FB_COPY_BACK() sceDmacMemcpy(screen_pixels, gu_3d_scratch, bytes)
+// The DMA above is the authority for screen_pixels here, so the whole-cache
+// call that follows it is correct in this configuration.
+#define GU_FB_GE_DONE()   sceKernelDcacheWritebackInvalidateAll()
 #endif
 #define GU_FB_DUMP_AT 600
 
@@ -596,7 +608,7 @@ struct GUTexVertex {
 // --- GPU tile layers (Stage C) ------------------------------------------
 //
 // Set to 1 to route eligible tile layers to the GE. Off until verified.
-#define GU_GPU_TILES 0
+#define GU_GPU_TILES 1
 
 // One quad per visible tile: 27x16 covers a 424x240 screen with a partial
 // tile at each edge, so ~432 quads (864 verts) per layer, a handful of
@@ -1902,7 +1914,7 @@ static void GU_Draw3DTestTriangleRaw()
     // Bring the composited result back, so the rest of the frame's CPU draws
     // and the present DMA both see it.
     GU_FB_COPY_BACK();
-    sceKernelDcacheWritebackInvalidateAll();
+    GU_FB_GE_DONE();
 
     {
         static int32 dbgDone = 0;
@@ -2004,7 +2016,7 @@ static void GU_DrawFaceBatch(int32 firstVert, int32 vertCount)
     const SceUInt64 t2 = gu_profilingEnabled ? sceKernelGetSystemTimeWide() : 0;
 
     GU_FB_COPY_BACK();
-    sceKernelDcacheWritebackInvalidateAll();
+    GU_FB_GE_DONE();
 
     if (gu_profilingEnabled) {
         const SceUInt64 t3 = sceKernelGetSystemTimeWide();
@@ -2176,7 +2188,7 @@ static void GU_DrawTileAtlasTest()
         sceGeListSync(qid, 0);
 
     GU_FB_COPY_BACK();
-    sceKernelDcacheWritebackInvalidateAll();
+    GU_FB_GE_DONE();
 }
 #endif
 
@@ -2271,7 +2283,7 @@ static void GU_DrawTileBatchRun(int32 firstEntry, int32 entryCount)
     const SceUInt64 t2 = gu_profilingEnabled ? sceKernelGetSystemTimeWide() : 0;
 
     GU_FB_COPY_BACK();
-    sceKernelDcacheWritebackInvalidateAll();
+    GU_FB_GE_DONE();
 
     if (gu_profilingEnabled) {
         const SceUInt64 t3 = sceKernelGetSystemTimeWide();
@@ -2349,7 +2361,7 @@ static void GU_DrawTileBatch(int32 firstVert, int32 vertCount, int32 bank)
     const SceUInt64 t2 = gu_profilingEnabled ? sceKernelGetSystemTimeWide() : 0;
 
     GU_FB_COPY_BACK();
-    sceKernelDcacheWritebackInvalidateAll();
+    GU_FB_GE_DONE();
 
     if (gu_profilingEnabled) {
         const SceUInt64 t3 = sceKernelGetSystemTimeWide();
@@ -2476,7 +2488,7 @@ static void GU_TileQuadSelfTest()
         sceGeListSync(qid, 0);
 
     GU_FB_COPY_BACK();
-    sceKernelDcacheWritebackInvalidateAll();
+    GU_FB_GE_DONE();
 
     FILE *f = fopen("tilequad_dbg.log", "w");
     if (!f)
@@ -2933,6 +2945,22 @@ void RenderDevice::CopyFrameBuffer()
   {
       static int32 fbDumpFrame = 0;
       if (++fbDumpFrame == GU_FB_DUMP_AT) {
+          FILE *df2 = fopen("disp.ppm", "wb");
+          if (df2) {
+              const u16 *disp = (const u16 *)psp_gu_vram_base;
+              fprintf(df2, "P6\n%d %d\n255\n", (int)PSP_SCREEN_WIDTH, (int)PSP_SCREEN_HEIGHT);
+              for (int32 y = 0; y < PSP_SCREEN_HEIGHT; ++y) {
+                  for (int32 x = 0; x < PSP_SCREEN_WIDTH; ++x) {
+                      const uint16 c = disp[y * PSP_LINE_SIZE + x];
+                      unsigned char rgb[3];
+                      rgb[0] = (unsigned char)(((c      ) & 0x1F) << 3);
+                      rgb[1] = (unsigned char)(((c >>  5) & 0x3F) << 2);
+                      rgb[2] = (unsigned char)(((c >> 11) & 0x1F) << 3);
+                      fwrite(rgb, 1, 3, df2);
+                  }
+              }
+              fclose(df2);
+          }
           FILE *pf = fopen("fb.ppm", "wb");
           if (pf) {
               fprintf(pf, "P6\n%d %d\n255\n", (int)MANIA_WIDTH, (int)MANIA_HEIGHT);
@@ -3196,6 +3224,8 @@ void RenderDevice::FlipScreen()
 
     GE_CMD(FBP, ((u32)psp_gu_vram_base & 0x00FFFFFF));
     GE_CMD(FBW, (((u32)psp_gu_vram_base & 0xFF000000) >> 8) | PSP_LINE_SIZE);
+    GE_CMD(TPSM, 0);  // GU_PSM_5650 -- see note above; do not remove
+    GE_CMD(TMODE, 0); // no mipmaps, not swizzled
     GE_CMD(TBP0, ((u32)screen_texture & 0x00FFFFFF));
     // Texture stride is the rasterizer surface's stride, which is now the
     // display's 512 rather than the old 432.
