@@ -20,6 +20,11 @@ namespace SKU
     uint8 stateZ;
     uint8 stateStart;
     uint8 stateSelect;
+
+    // Analog stick, -1..1, y positive up. Sampling is already in ANALOG mode;
+    // the stick simply was never read.
+    float hDelta_L;
+    float vDelta_L;
   };
 
   void InitPSPInputAPI();

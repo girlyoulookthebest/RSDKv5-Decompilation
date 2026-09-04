@@ -20,6 +20,12 @@ static int32 remap[12] = {
 
 int32 last_buttons = 0;
 
+// Wider than the engine's 0.3: a PSP stick is rarely centred and drifts as it
+// wears, and a false direction in a menu is far more noticeable than a slightly
+// larger dead area in gameplay.
+#define PSP_STICK_DEADZONE 0.3f
+#define PSP_STICK_LOG 0
+
 void RSDK::SKU::InputDevicePSP::UpdateInput()
 {
   SceCtrlData ctrl_data;
@@ -35,6 +41,33 @@ void RSDK::SKU::InputDevicePSP::UpdateInput()
     mappings[i].down = kDown & remap[i];
     mappings[i].press = kPress & remap[i];
   }
+  // The analog stick reports 0..255 per axis, centred at 128. Ly grows
+  // downwards, so it is negated to match RSDK's convention of positive = up.
+  // Scaled by 128 so a fully deflected stick reaches 1.0.
+  this->hDelta_L = ((float)ctrl_data.Lx - 128.0f) / 128.0f;
+  this->vDelta_L = -((float)ctrl_data.Ly - 128.0f) / 128.0f;
+
+#if PSP_STICK_LOG
+  {
+      static int32 n = 0;
+      static uint8 loX = 255, hiX = 0, loY = 255, hiY = 0;
+      if (ctrl_data.Lx < loX) loX = ctrl_data.Lx;
+      if (ctrl_data.Lx > hiX) hiX = ctrl_data.Lx;
+      if (ctrl_data.Ly < loY) loY = ctrl_data.Ly;
+      if (ctrl_data.Ly > hiY) hiY = ctrl_data.Ly;
+      if (++n == 600) {
+          FILE *sf = fopen("stick.log", "w");
+          if (sf) {
+              fprintf(sf, "over 600 frames: Lx %d..%d   Ly %d..%d  (centre should be ~128)\n", (int)loX, (int)hiX, (int)loY, (int)hiY);
+              fprintf(sf, "as deltas: h %.3f..%.3f  v %.3f..%.3f  (deadzone %.2f)\n",
+                      (loX - 128.0f) / 128.0f, (hiX - 128.0f) / 128.0f,
+                      -(hiY - 128.0f) / 128.0f, -(loY - 128.0f) / 128.0f, PSP_STICK_DEADZONE);
+              fclose(sf);
+          }
+      }
+  }
+#endif
+
   last_buttons = ctrl_data.Buttons;
 }
 
@@ -66,7 +99,17 @@ void RSDK::SKU::InputDevicePSP::ProcessInput(int32 controllerID)
     controller[i].keyZ.press        |= mappings[9].down;
     controller[i].keyStart.press    |= mappings[10].down;
     controller[i].keySelect.press   |= mappings[11].down;
+
+    // Fold the stick into the d-pad as well. Gameplay reads the digital
+    // direction keys, so publishing stickL alone would only work in menus.
+    controller[i].keyUp.press      |= this->vDelta_L > PSP_STICK_DEADZONE;
+    controller[i].keyDown.press    |= this->vDelta_L < -PSP_STICK_DEADZONE;
+    controller[i].keyLeft.press    |= this->hDelta_L < -PSP_STICK_DEADZONE;
+    controller[i].keyRight.press   |= this->hDelta_L > PSP_STICK_DEADZONE;
   }
+
+  stickL[controllerID].hDelta = this->hDelta_L;
+  stickL[controllerID].vDelta = this->vDelta_L;
 }
 
 // code below here borrowed liberally from the other backends and
@@ -92,6 +135,8 @@ RSDK::SKU::InputDevicePSP *RSDK::SKU::InitPSPDevice(uint32 id) {
   device->id = id;
   device->active = true;
   device->anyPress = 1;
+  device->hDelta_L = 0.0f;
+  device->vDelta_L = 0.0f;
 
   inputSlots[0] = device->id;
   inputSlotDevices[0] = device;
