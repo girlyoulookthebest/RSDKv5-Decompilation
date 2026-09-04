@@ -168,6 +168,18 @@ static int32 present_buffer_index = 0;
 static u32 __attribute__((aligned(16))) ge_cmd_buffers[2][64];
 #define ge_cmd (ge_cmd_buffers[present_buffer_index])
 static u16 *psp_gu_vram_base = (u16 *)(0x44000000);//0x600000
+
+// The display was single-buffered: the present quad rendered straight into the
+// buffer the LCD was scanning out, so the panel showed a half-updated frame
+// every frame. It reads as tearing along horizontal edges and is worst wherever
+// the image moves fastest -- the foreground and ground at the bottom of the
+// screen -- while the near-static sky looks clean.
+//
+// Second buffer sits at the top of VRAM, above the sprite arena.
+#define PSP_DISP_BYTES ((size_t)PSP_LINE_SIZE * PSP_SCREEN_HEIGHT * sizeof(u16))
+static u16 *gu_dispFront = (u16 *)(0x44000000);
+static u16 *gu_dispBack  = (u16 *)(0x44000000 + PSP_DISP_BYTES);
+static bool gu_dispPending = false;
 static u32 *ge_cmd_ptr = ge_cmd_buffers[0];
 static u32 gecbid;
 static u32 video_direct = 0;
@@ -227,8 +239,8 @@ static int gu_presentListId = -1;
 // It would have to either draw after this transfer (into screen_texture,
 // giving up interleaved ordering) or keep its own VRAM target. Do not simply
 // re-alias these to make GPU drawing work -- that reintroduces this cost.
-static u16 *screen_texture = (u16 *)(0x4000000 + (512 * 272 * 2));
-static u16 *current_screen_texture = (u16 *)(0x4000000 + (512 * 272 * 2));
+static u16 *screen_texture = (u16 *)(0x4000000 + 2 * (512 * 272 * 2));
+static u16 *current_screen_texture = (u16 *)(0x4000000 + 2 * (512 * 272 * 2));
 
 // VRAM scratch render target for GPU 3D faces.
 //
@@ -241,7 +253,7 @@ static u16 *current_screen_texture = (u16 *)(0x4000000 + (512 * 272 * 2));
 // Instead the frame makes a round trip through here: DMA out, GE draws, DMA
 // back. Sits immediately after screen_texture; at 448x240x2 that is 215040
 // bytes, leaving ~1.35MB of VRAM still free.
-static u16 *gu_3d_scratch = (u16 *)(0x4000000 + (512 * 272 * 2) + (448 * 240 * 2));
+static u16 *gu_3d_scratch = (u16 *)(0x4000000 + 2 * (512 * 272 * 2) + (448 * 240 * 2));
 static u16 *screen_pixels = NULL;
 static u32 screen_pitch = 424;
 
@@ -3032,7 +3044,7 @@ void RenderDevice::CopyFrameBuffer()
       if (++fbDumpFrame == GU_FB_DUMP_AT) {
           FILE *df2 = fopen("disp.ppm", "wb");
           if (df2) {
-              const u16 *disp = (const u16 *)psp_gu_vram_base;
+              const u16 *disp = (const u16 *)gu_dispFront;
               fprintf(df2, "P6\n%d %d\n255\n", (int)PSP_SCREEN_WIDTH, (int)PSP_SCREEN_HEIGHT);
               for (int32 y = 0; y < PSP_SCREEN_HEIGHT; ++y) {
                   for (int32 x = 0; x < PSP_SCREEN_WIDTH; ++x) {
@@ -3151,10 +3163,76 @@ void GU_MarkRasterEnd()
         gu_rasterUsecAccum += sceKernelGetSystemTimeWide() - gu_rasterStartTick;
 }
 
+// Frame pacing. Averages hide judder: a steady 56fps and a 60fps stream with
+// one long stall per second produce the same average and feel completely
+// different. This counts how many vblanks each delivered frame actually took.
+//
+// Everything is kept in memory and written once at the end. Writing to the
+// memory stick every 60 frames is itself a multi-millisecond stall, so a
+// periodic report would manufacture the spikes it is meant to detect.
+#define GU_PACE_SPIKES    16
+#define GU_PACE_REPORT_AT 1800   // ~30s at 60fps
+
+static int32 gu_paceBucket[5];
+static SceUInt64 gu_paceWorst = 0;
+static SceUInt64 gu_paceLast  = 0;
+static int32 gu_paceFrames    = 0;
+static SceUInt64 gu_spikeUsec[GU_PACE_SPIKES];
+static int32 gu_spikeFrame[GU_PACE_SPIKES];
+static int32 gu_spikeCount = 0;
+static bool gu_paceReported = false;
+
+static void GU_SampleFramePacing()
+{
+    const SceUInt64 now = sceKernelGetSystemTimeWide();
+
+    if (gu_paceLast) {
+        const SceUInt64 dt = now - gu_paceLast;
+        if (dt > gu_paceWorst)
+            gu_paceWorst = dt;
+
+        int32 v = (int32)((dt + 8333) / 16667); // nearest whole vblank
+        if (v < 1)
+            v = 1;
+        if (v > 5)
+            v = 5;
+        ++gu_paceBucket[v - 1];
+
+        if (v > 1 && gu_spikeCount < GU_PACE_SPIKES) {
+            gu_spikeUsec[gu_spikeCount]  = dt;
+            gu_spikeFrame[gu_spikeCount] = gu_paceFrames;
+            ++gu_spikeCount;
+        }
+    }
+
+    gu_paceLast = now;
+    ++gu_paceFrames;
+
+    if (gu_paceFrames >= GU_PACE_REPORT_AT && !gu_paceReported) {
+        gu_paceReported = true;
+        FILE *pf = fopen("pacing.log", "w");
+        if (pf) {
+            fprintf(pf, "frames sampled : %d\n", (int)gu_paceFrames);
+            fprintf(pf, "1 vblank  (60fps) : %d\n", (int)gu_paceBucket[0]);
+            fprintf(pf, "2 vblanks (30fps) : %d\n", (int)gu_paceBucket[1]);
+            fprintf(pf, "3 vblanks         : %d\n", (int)gu_paceBucket[2]);
+            fprintf(pf, "4 vblanks         : %d\n", (int)gu_paceBucket[3]);
+            fprintf(pf, "5+ vblanks        : %d\n", (int)gu_paceBucket[4]);
+            fprintf(pf, "worst frame       : %.2f ms\n\n", (double)gu_paceWorst / 1000.0);
+            fprintf(pf, "first %d long frames (frame : ms):\n", (int)gu_spikeCount);
+            for (int32 i = 0; i < gu_spikeCount; ++i)
+                fprintf(pf, "  %6d : %7.2f\n", (int)gu_spikeFrame[i], (double)gu_spikeUsec[i] / 1000.0);
+            fclose(pf);
+        }
+    }
+}
+
 static void GU_UpdateFPSCounter()
 {
     static int32 frameCount = 0;
     static SceUInt64 lastTick = 0;
+
+    GU_SampleFramePacing();
 
     if (++frameCount < 60)
         return;
@@ -3172,7 +3250,7 @@ static void GU_UpdateFPSCounter()
         double dlistMs    = (double)gu_objDrawListUsecAccum / 1000.0 / frameCount;
         double flipMs     = (double)gu_flipUsecAccum / 1000.0 / frameCount;
 #if GU_ENABLE_PROFILING
-        FILE *f           = fopen(GU_FPS_LOG, "w");
+        FILE *f           = gu_paceReported ? fopen(GU_FPS_LOG, "w") : NULL;
         if (f) {
             fprintf(f, "%.2f fps\n", fps);
             fprintf(f, "frame %.2f ms = compute %.2f + idle(vblank) %.2f\n", frameMs, frameMs - vblankMs, vblankMs);
@@ -3209,7 +3287,7 @@ static void GU_UpdateFPSCounter()
         // logging tried earlier, which stalled the game to ~1fps.
         static int32 windowIndex = 0;
         if (windowIndex < 2000) {
-            FILE *h = fopen("fps_history.log", windowIndex == 0 ? "w" : "a");
+            FILE *h = gu_paceReported ? fopen("fps_history.log", "w") : NULL;
             if (h) {
                 fprintf(h, "%3d  %5.2f fps  frame %6.2f  cpu %6.2f  idle %6.2f  raster %6.2f  upd %6.2f  dlist %6.2f  flip %6.2f  other %6.2f  |  "
                            "spr %5.2f/%-5.1f  lay %5.2f  fill %5.2f/%-4.1f  face %5.2f/%-5.1f  bface %5.2f/%-5.1f  cout %5.2f/%-5.1f  rect %5.2f  "
@@ -3307,8 +3385,42 @@ void RenderDevice::FlipScreen()
     // it is NOT waited on here -- see the note further down.
     ge_cmd_ptr = ge_cmd;
 
-    GE_CMD(FBP, ((u32)psp_gu_vram_base & 0x00FFFFFF));
-    GE_CMD(FBW, (((u32)psp_gu_vram_base & 0xFF000000) >> 8) | PSP_LINE_SIZE);
+    // The present enqueued last frame was waited on in CopyFrameBuffer before
+    // screen_texture was overwritten, so by now it is complete and safe to show.
+    if (gu_dispPending) {
+        const int setRc = sceDisplaySetFrameBuf((void *)gu_dispBack, PSP_LINE_SIZE, PSP_DISPLAY_PIXEL_FORMAT_565,
+                              PSP_DISPLAY_SETBUF_NEXTFRAME);
+        {
+            static int32 logged = 0;
+            if (logged < 4) {
+                ++logged;
+                FILE *dl = fopen("disp_dbg.log", logged == 1 ? "w" : "a");
+                if (dl) {
+                    if (logged == 1)
+                        fprintf(dl, "front=%p back=%p screen_texture=%p screen_pixels=%p atlas=%p arena=%p arenaSize=%u\n",
+                                (void *)gu_dispFront, (void *)gu_dispBack, (void *)screen_texture,
+                                (void *)screen_pixels, (void *)gu_tile_atlas, (void *)gu_tex_arena,
+                                (unsigned)gu_tex_arena_size);
+                    fprintf(dl, "swap %d: setFrameBuf(%p) rc=%d (0 = ok)\n", (int)logged, (void *)gu_dispBack, setRc);
+                    fclose(dl);
+                }
+            }
+        }
+        u16 *swap    = gu_dispFront;
+        gu_dispFront = gu_dispBack;
+        gu_dispBack  = swap;
+    }
+    gu_dispPending = true;
+
+    {
+        const SceUInt64 waitStart = sceKernelGetSystemTimeWide();
+        sceDisplayWaitVblankStart();
+        gu_vblankThisFrame = sceKernelGetSystemTimeWide() - waitStart;
+        gu_vblankUsecAccum += gu_vblankThisFrame;
+    }
+
+    GE_CMD(FBP, ((u32)gu_dispBack & 0x00FFFFFF));
+    GE_CMD(FBW, (((u32)gu_dispBack & 0xFF000000) >> 8) | PSP_LINE_SIZE);
     GE_CMD(TPSM, 0);  // GU_PSM_5650 -- see note above; do not remove
     GE_CMD(TMODE, 0); // no mipmaps, not swizzled
     GE_CMD(TBP0, ((u32)screen_texture & 0x00FFFFFF));
@@ -3355,12 +3467,6 @@ void RenderDevice::FlipScreen()
     // spent idle here. Without measuring it, "rest" conflates real game logic
     // with that idle time, and there's no way to tell how much headroom
     // actually exists before optimizing anything.
-    {
-        const SceUInt64 waitStart = sceKernelGetSystemTimeWide();
-        sceDisplayWaitVblankStart();
-        gu_vblankThisFrame = sceKernelGetSystemTimeWide() - waitStart;
-        gu_vblankUsecAccum += gu_vblankThisFrame;
-    }
 
 
     // NO sceGuSync here. Waiting for the GE to finish the present blit costs
