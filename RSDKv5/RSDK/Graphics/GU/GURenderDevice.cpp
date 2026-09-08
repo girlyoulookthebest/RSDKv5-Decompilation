@@ -165,6 +165,19 @@ static int32 present_buffer_index = 0;
 // uncached write-throughs to VRAM. One dcache writeback before
 // sceGeListEnQueue publishes it (the GE reads physical memory, so main RAM is
 // a perfectly good list source).
+// A coalesced tile run writes 9 header words, 21 per batch (scissor pair,
+// GU_EmitTileTextureState's 15, and VTYPE/BASE/VADDR/PRIM) and an 8-word
+// footer. At 64 words that overflowed at three batches: the FINISH/END
+// terminators landed outside the buffer, so the GE ran off the end of the list
+// and executed adjacent memory as commands -- colour noise, then the console
+// powering off. Layer banding is what first produced runs that long.
+#define GE_TRI_CMD_WORDS 1024
+#define GE_TRI_RUN_HEADER 9
+#define GE_TRI_RUN_FOOTER 8
+#define GE_TRI_PER_BATCH  21
+// Longest run that certainly fits, with a word of slack.
+#define GU_TILE_RUN_MAX ((GE_TRI_CMD_WORDS - GE_TRI_RUN_HEADER - GE_TRI_RUN_FOOTER - 1) / GE_TRI_PER_BATCH)
+
 static u32 __attribute__((aligned(16))) ge_cmd_buffers[2][64];
 #define ge_cmd (ge_cmd_buffers[present_buffer_index])
 static u16 *psp_gu_vram_base = (u16 *)(0x44000000);//0x600000
@@ -592,6 +605,11 @@ struct GUFaceVertex {
 // the GE flips by swapping texture coordinates, so the other three are free.
 #define GU_ATLAS_DIM       512
 #define GU_ATLAS_TILES_ROW (GU_ATLAS_DIM / TILE_SIZE) // 32
+// Above this a layer is genuinely warped rather than scrolled, and the
+// per-band batches would cost more than the CPU rasterizer.
+#define GU_TILE_MAX_BANDS  8
+// Diagnostic: hold L to route layers back to the CPU rasterizer for a live A/B.
+#define GU_TILE_PAD_TOGGLE 1
 static u8 *gu_tile_atlas       = NULL;
 static int32 gu_tile_atlas_ok  = 0;
 static int32 gu_atlas_scene    = -1; // listPos the atlas was built for
@@ -610,6 +628,27 @@ void RSDK::GU_MarkTilesDirty(int32 first, int32 count)
 }
 
 void RSDK::GU_MarkAllTilesDirty() { gu_atlas_all_dirty = true; }
+
+#if GU_TILE_PAD_TOGGLE
+#include <pspctrl.h>
+// Hold L to route every layer, or R every 3D face, back to the CPU rasterizer,
+// so the same spot in the same run can be compared both ways.
+static bool GU_PadDisablesTiles()
+{
+    SceCtrlData pad;
+    if (sceCtrlPeekBufferPositive(&pad, 1) > 0)
+        return (pad.Buttons & PSP_CTRL_LTRIGGER) != 0;
+    return false;
+}
+
+static bool GU_PadDisablesFaces()
+{
+    SceCtrlData pad;
+    if (sceCtrlPeekBufferPositive(&pad, 1) > 0)
+        return (pad.Buttons & PSP_CTRL_RTRIGGER) != 0;
+    return false;
+}
+#endif
 static int32 gu_atlas_frame    = -1; // frame the hash was last checked on
 static int32 gu_frameCounter   = 0;
 static void GU_BuildTileAtlas();
@@ -625,6 +664,9 @@ static void GU_BuildTileAtlas();
 // refusal is silent otherwise, which makes "nothing went to the GE" and
 // "everything went to the GE and drew nothing" look identical from outside.
 static int32 gu_tile_decline[9] = { 0 };
+static int32 gu_faceRejectRange = 0;  // projected outside the GE's usable range
+static int32 gu_faceRejectFull  = 0;  // vertex buffer exhausted this frame
+static int32 gu_faceRejectInk   = 0;  // ink effect or vert count the GE path cannot express
 static FILE *gu_layerLog = NULL;
 static int32 gu_layerLogFrame = 0;
 // distinct per-scanline palette banks over the clip range, for diagnosis
@@ -816,7 +858,7 @@ static uint32 gu_profCount[GU_ENTRY_TYPE_COUNT];
 // (it's a handful of sceKernelGetSystemTimeWide calls per frame, far below
 // measurement noise) so turning this back on is the only step needed to
 // profile again.
-#define GU_ENABLE_PROFILING 0
+#define GU_ENABLE_PROFILING 1
 
 // Runtime mirror of the switch above, so the Scene3D timers (in another
 // translation unit) can gate on it without needing the macro. With profiling
@@ -1242,6 +1284,10 @@ static void GU_DrawLayerImmediate(TileLayer *layer)
 
 static bool GU_TryQueueLayerGPU(TileLayer *layer)
 {
+#if GU_TILE_PAD_TOGGLE
+    if (GU_PadDisablesTiles())
+        GU_DECLINE(0);
+#endif
     if (layer->type != LAYER_BASIC && layer->type != LAYER_HSCROLL)
         GU_DECLINE(0);
     if (!gu_tile_verts)
@@ -1273,112 +1319,181 @@ static bool GU_TryQueueLayerGPU(TileLayer *layer)
     // it per line for its horizon gradient. One CLUT cannot express that,
     // so those layers stay on the CPU.
     int32 bank = 0;
-    if (layer->type == LAYER_HSCROLL) {
-        const int32 x0 = scanlines[clipY1].position.x;
-        for (int32 cy = clipY1 + 1; cy < clipY2; ++cy)
-            if (scanlines[cy].position.x != x0)
-                GU_DECLINE(6);
-    }
     if (!GU_PaletteUniform(clipY1, clipY2 - clipY1, &bank))
         GU_DECLINE(7);
 
-    const ScanlineInfo *scanline = &scanlines[clipY1];
+    // Scanlines sharing one integer x scroll form a band that is a plain grid,
+    // and each band can be drawn as its own batch. Requiring the raw
+    // fixed-point x to be identical across the whole layer was too strict: the
+    // Special Stage's HSCROLL layers drift by a single pixel over 240 lines, so
+    // they were refused and cost 6ms/frame on the CPU despite being two bands
+    // wide. Genuinely warped layers (the 512x512 rotozoom spans 1582px) produce
+    // far more bands than this and still decline.
+    //
+    // Banding on the integer position, not the fixed-point one, is exact: the
+    // CPU rasterizer addresses tiles in whole pixels too.
+    int32 bandStart[GU_TILE_MAX_BANDS], bandEnd[GU_TILE_MAX_BANDS], bandX[GU_TILE_MAX_BANDS];
+    int32 bandCount = 0;
+
+    if (layer->type == LAYER_BASIC) {
+        // DrawLayerBasic uses one scroll for the whole layer regardless of what
+        // the individual scanlines say, so it is always a single band.
+        bandStart[0] = clipY1;
+        bandEnd[0]   = clipY2;
+        bandX[0]     = FROM_FIXED(scanlines[clipY1].position.x);
+        bandCount    = 1;
+    }
+    else {
+        int32 cur = FROM_FIXED(scanlines[clipY1].position.x);
+        int32 st  = clipY1;
+        for (int32 cy = clipY1 + 1; cy < clipY2; ++cy) {
+            const int32 xv = FROM_FIXED(scanlines[cy].position.x);
+            if (xv == cur)
+                continue;
+            if (bandCount == GU_TILE_MAX_BANDS)
+                GU_DECLINE(6);
+            bandStart[bandCount] = st;
+            bandEnd[bandCount]   = cy;
+            bandX[bandCount]     = cur;
+            ++bandCount;
+            st  = cy;
+            cur = xv;
+        }
+        if (bandCount == GU_TILE_MAX_BANDS)
+            GU_DECLINE(6);
+        bandStart[bandCount] = st;
+        bandEnd[bandCount]   = clipY2;
+        bandX[bandCount]     = cur;
+        ++bandCount;
+    }
+
     // The two layer types differ in where a row starts, and getting this
     // wrong shifts the whole layer: DrawLayerBasic begins at
     // clipBound_X1, but DrawLayerHScroll begins at framebuffer offset 0
     // and spans the full pitch.
     const int32 originX = (layer->type == LAYER_BASIC) ? clipX1 : 0;
     const int32 spanX   = (layer->type == LAYER_BASIC) ? (clipX2 - clipX1) : (int32)currentScreen->pitch;
-    const int32 worldX = originX + FROM_FIXED(scanline->position.x);
-    const int32 worldY = FROM_FIXED(scanline->position.y);
-    const int32 sheetX = worldX & 0xF, sheetY = worldY & 0xF;
-    const int32 tx0 = worldX >> 4, ty0 = worldY >> 4;
 
-    const int32 cols = (spanX + sheetX + TILE_SIZE - 1) / TILE_SIZE + 1;
-    const int32 rows = ((clipY2 - clipY1) + sheetY + TILE_SIZE - 1) / TILE_SIZE + 1;
+    // GU_FlushDrawQueue resets gu_tile_vert_count to 0. Draining part-way
+    // through a layer therefore invalidates the firstVert of bands already
+    // emitted: their queue entries keep pointing high into the buffer while the
+    // remaining bands refill it from zero, so the GE reads vertices that are
+    // being overwritten underneath it. That is wild screen coordinates and
+    // texture addresses -- on hardware it showed as colour noise and then a
+    // power-off. Reserve the whole layer's entries first, while flushing is
+    // still harmless.
+    // GU_FlushDrawQueue resets gu_tile_vert_count to 0, so draining part-way
+    // through a layer leaves earlier bands' entries pointing at vertices the
+    // remaining bands then overwrite. Reserve the whole layer's entries while
+    // flushing is still harmless.
+    if (gu_draw_queue_count + bandCount > GU_DRAW_QUEUE_MAX)
+        GU_FlushDrawQueue();
+    if (gu_draw_queue_count + bandCount > GU_DRAW_QUEUE_MAX)
+        GU_DECLINE(8); // still no room: leave the whole layer on the CPU
 
-    if (gu_tile_vert_count + cols * rows * 2 > gu_tile_vert_max)
-        GU_DECLINE(8); // no room -- CPU path rather than a partial layer
-
-    gu_tile_vert_count = (gu_tile_vert_count + 7) & ~7;
-    if (gu_tile_vert_count + cols * rows * 2 > gu_tile_vert_max)
-        GU_DECLINE(8);
-    const int32 firstVert = gu_tile_vert_count;
-
-    for (int32 j = 0; j < rows; ++j) {
-        int32 ty = ty0 + j;
-        ty %= layer->ysize;
-        if (ty < 0)
-            ty += layer->ysize;
-
-        const uint16 *row = &layer->layout[ty << layer->widthShift];
-        const int32 sy    = clipY1 - sheetY + j * TILE_SIZE;
-
-        for (int32 i = 0; i < cols; ++i) {
-            int32 tx = tx0 + i;
-            tx %= layer->xsize;
-            if (tx < 0)
-                tx += layer->xsize;
-
-            const uint16 entry = row[tx];
-            if (entry == 0xFFFF)
-                continue; // empty tile
-
-            // Index is 10 bits: TILE_COUNT is 0x400. Bits 10-11 are the flip
-            // flags (FlipFlags: 1 = X, 2 = Y), which the CPU path resolves by
-            // indexing pre-generated variants in tilesetPixels[TILESET_SIZE*4].
-            // Masking with 0xFFF folded those flags into the index, so every
-            // flipped tile pointed past the 1024 tiles the atlas holds, sampled
-            // empty atlas, and vanished -- which is why foreground layers (lots
-            // of mirrored tiles) disappeared while skies rendered fine.
-            const int32 tile = entry & 0x3FF;
-            const int32 flip = (entry >> 10) & 3;
-            const int32 au   = (tile % GU_ATLAS_TILES_ROW) * TILE_SIZE;
-            const int32 av   = (tile / GU_ATLAS_TILES_ROW) * TILE_SIZE;
-            const int32 sx   = originX - sheetX + i * TILE_SIZE;
-
-            GUTexVertex *v = &gu_tile_verts[gu_tile_vert_count];
-            gu_tile_vert_count += 2;
-
-            // Flip by swapping texture coordinates instead of packing all four
-            // variants: 4096 tiles would need a 1024x1024 atlas (1MB), and the
-            // GE mirrors for free when the second corner's u/v run backwards.
-            s16 u0 = (s16)au, u1 = (s16)(au + TILE_SIZE);
-            s16 v0 = (s16)av, v1 = (s16)(av + TILE_SIZE);
-            if (flip & 1) { const s16 t = u0; u0 = u1; u1 = t; }
-            if (flip & 2) { const s16 t = v0; v0 = v1; v1 = t; }
-
-            // GU_SPRITES takes two corners. Partial tiles at the screen edge
-            // need no special handling -- the scissor clips them, which is
-            // most of what makes this simpler than the CPU version.
-            v[0].u = u0;                  v[0].v = v0;
-            v[0].x = (s16)sx;             v[0].y = (s16)sy;             v[0].z = 0;
-            v[1].u = u1;                  v[1].v = v1;
-            v[1].x = (s16)(sx + TILE_SIZE); v[1].y = (s16)(sy + TILE_SIZE); v[1].z = 0;
+    // Worst case for the whole layer up front, so a batch is never emitted for
+    // some bands and dropped for others -- that would draw a partial layer.
+    {
+        int32 worstVerts = 0;
+        for (int32 b = 0; b < bandCount; ++b) {
+            const int32 wx   = originX + bandX[b];
+            const int32 wy   = FROM_FIXED(scanlines[bandStart[b]].position.y);
+            const int32 cols = (spanX + (wx & 0xF) + TILE_SIZE - 1) / TILE_SIZE + 1;
+            const int32 rows = ((bandEnd[b] - bandStart[b]) + (wy & 0xF) + TILE_SIZE - 1) / TILE_SIZE + 1;
+            worstVerts += cols * rows * 2 + 8; // +8 covers the per-batch alignment
         }
+        if (gu_tile_vert_count + worstVerts > gu_tile_vert_max)
+            GU_DECLINE(8); // no room -- CPU path rather than a partial layer
     }
 
-    const int32 used = gu_tile_vert_count - firstVert;
+    int32 totalUsed = 0;
+
+    for (int32 b = 0; b < bandCount; ++b) {
+        const int32 byStart = bandStart[b], byEnd = bandEnd[b];
+        const int32 worldX  = originX + bandX[b];
+        const int32 worldY  = FROM_FIXED(scanlines[byStart].position.y);
+        const int32 sheetX  = worldX & 0xF, sheetY = worldY & 0xF;
+        const int32 tx0 = worldX >> 4, ty0 = worldY >> 4;
+
+        const int32 cols = (spanX + sheetX + TILE_SIZE - 1) / TILE_SIZE + 1;
+        const int32 rows = ((byEnd - byStart) + sheetY + TILE_SIZE - 1) / TILE_SIZE + 1;
+
+        gu_tile_vert_count = (gu_tile_vert_count + 7) & ~7;
+        const int32 firstVert = gu_tile_vert_count;
+
+        for (int32 j = 0; j < rows; ++j) {
+            int32 ty = ty0 + j;
+            ty %= layer->ysize;
+            if (ty < 0)
+                ty += layer->ysize;
+
+            const uint16 *row = &layer->layout[ty << layer->widthShift];
+            const int32 sy    = byStart - sheetY + j * TILE_SIZE;
+
+            for (int32 i = 0; i < cols; ++i) {
+                int32 tx = tx0 + i;
+                tx %= layer->xsize;
+                if (tx < 0)
+                    tx += layer->xsize;
+
+                const uint16 entry = row[tx];
+                if (entry == 0xFFFF)
+                    continue; // empty tile
+
+                // Index is 10 bits: TILE_COUNT is 0x400. Bits 10-11 are the
+                // flip flags (FlipFlags: 1 = X, 2 = Y), which the CPU path
+                // resolves via pre-generated variants in tilesetPixels.
+                const int32 tile = entry & 0x3FF;
+                const int32 flip = (entry >> 10) & 3;
+                const int32 au   = (tile % GU_ATLAS_TILES_ROW) * TILE_SIZE;
+                const int32 av   = (tile / GU_ATLAS_TILES_ROW) * TILE_SIZE;
+                const int32 sx   = originX - sheetX + i * TILE_SIZE;
+
+                GUTexVertex *v = &gu_tile_verts[gu_tile_vert_count];
+                gu_tile_vert_count += 2;
+
+                // Flip by swapping texture coordinates rather than packing all
+                // four variants: 4096 tiles would need a 1MB atlas, and the GE
+                // mirrors for free when the second corner's u/v run backwards.
+                s16 u0 = (s16)au, u1 = (s16)(au + TILE_SIZE);
+                s16 v0 = (s16)av, v1 = (s16)(av + TILE_SIZE);
+                if (flip & 1) { const s16 t = u0; u0 = u1; u1 = t; }
+                if (flip & 2) { const s16 t = v0; v0 = v1; v1 = t; }
+
+                v[0].u = u0;                    v[0].v = v0;
+                v[0].x = (s16)sx;               v[0].y = (s16)sy;             v[0].z = 0;
+                v[1].u = u1;                    v[1].v = v1;
+                v[1].x = (s16)(sx + TILE_SIZE); v[1].y = (s16)(sy + TILE_SIZE); v[1].z = 0;
+            }
+        }
+
+        const int32 used = gu_tile_vert_count - firstVert;
+        if (!used)
+            continue;
+        totalUsed += used;
+
+        // No drain here -- see the note above; capacity was reserved already.
+        GUQueueEntry *e        = &gu_draw_queue[gu_draw_queue_count++];
+        e->type                = GU_ENTRY_TILEBATCH;
+        e->tileBatch.firstVert = firstVert;
+        e->tileBatch.vertCount = used;
+        e->tileBatch.bank      = bank;
+        // Scissor to this band only, so bands cannot paint over each other.
+        e->tileBatch.screenSnapshot = *currentScreen;
+        e->tileBatch.screenSnapshot.clipBound_Y1 = byStart;
+        e->tileBatch.screenSnapshot.clipBound_Y2 = byEnd;
+    }
+
     if (gu_layerLog) {
         int32 fb_ = 0, lb_ = 0;
         const int32 ns_ = GU_BankSpread(clipY1, clipY2 - clipY1, &fb_, &lb_);
-        fprintf(gu_layerLog, "  GPU  type=%d draw=%d size=%dx%d bank=%d verts=%d banks=%d(%d..%d)\n",
+        fprintf(gu_layerLog, "  GPU  type=%d draw=%d size=%dx%d bank=%d bands=%d verts=%d pal=%d(%d..%d)\n",
                 (int)layer->type, (int)layer->drawGroup[0], (int)layer->xsize,
-                (int)layer->ysize, (int)bank, (int)used, (int)ns_, (int)fb_, (int)lb_);
+                (int)layer->ysize, (int)bank, (int)bandCount, (int)totalUsed, (int)ns_, (int)fb_, (int)lb_);
     }
-    if (!used)
-        return true; // nothing visible; still "handled"
-
-    GU_DrainQueueIfFull();
-    GUQueueEntry *e         = &gu_draw_queue[gu_draw_queue_count++];
-    e->type                 = GU_ENTRY_TILEBATCH;
-    e->tileBatch.firstVert  = firstVert;
-    e->tileBatch.vertCount  = used;
-    // The bank just verified to be uniform across this layer's scanlines.
-    e->tileBatch.bank       = bank;
-    e->tileBatch.screenSnapshot = *currentScreen;
     return true;
 }
+
 void RSDK::GU_QueueLayerDraw(TileLayer *layer)
 {
 #if GU_BYPASS_DRAW_QUEUE
@@ -1568,7 +1683,13 @@ void GU_QueueBlendedFaceDraw(Vector2 *vertices, uint32 *colors, int32 vertCount,
     // NOTE: alpha is deliberately NOT tested. For INK_NONE the CPU rasterizer
     // ignores it and writes opaquely -- the game passes 0 here -- so requiring
     // alpha >= 0xFF rejected every face in the game.
-    if (inkEffect == INK_NONE && (vertCount == 3 || vertCount == 4)) {
+    if (!(inkEffect == INK_NONE && (vertCount == 3 || vertCount == 4)))
+        ++gu_faceRejectInk;
+    if (inkEffect == INK_NONE && (vertCount == 3 || vertCount == 4)
+#if GU_TILE_PAD_TOGGLE
+        && !GU_PadDisablesFaces()
+#endif
+        ) {
         const int32 needed = (vertCount == 3) ? 3 : 6; // quads become two triangles
         // Reject faces whose projected coordinates are out of range.
         //
@@ -1588,6 +1709,11 @@ void GU_QueueBlendedFaceDraw(Vector2 *vertices, uint32 *colors, int32 vertCount,
                 break;
             }
         }
+
+        if (!inRange)
+            ++gu_faceRejectRange;
+        else if (gu_face_verts && gu_face_vert_count + needed > gu_face_vert_max)
+            ++gu_faceRejectFull;
 
         if (inRange && gu_face_verts && gu_face_vert_count + needed <= gu_face_vert_max) {
             // Extend the batch if the previous entry is one and is still the
@@ -1820,8 +1946,9 @@ void GU_FlushDrawQueue()
             case GU_ENTRY_TILEBATCH: {
                 // Consecutive tile batches share one VRAM round trip.
                 int32 last = i;
-                while (last + 1 < gu_draw_queue_count && gu_draw_queue[last + 1].type == GU_ENTRY_TILEBATCH)
-                    ++last;
+                while (last + 1 < gu_draw_queue_count && gu_draw_queue[last + 1].type == GU_ENTRY_TILEBATCH
+                       && (last - i + 1) < GU_TILE_RUN_MAX)
+                    ++last; // a longer run would not fit in ge_tri_cmd
                 GU_DrawTileBatchRun(i, last - i + 1);
                 i = last;
                 break;
@@ -1890,7 +2017,7 @@ static void Ge_Finish_Callback(int id, void *arg)
 //
 // Own command buffer and pointer: ge_cmd_ptr belongs to FlipScreen, so this
 // saves and restores it rather than sharing.
-static u32 __attribute__((aligned(16))) ge_tri_cmd[64];
+static u32 __attribute__((aligned(16))) ge_tri_cmd[GE_TRI_CMD_WORDS];
 static GUFaceVertex __attribute__((aligned(16))) ge_tri_verts[3];
 
 #if GU_3D_TEST_TRIANGLE
@@ -2331,6 +2458,10 @@ static void GU_DrawTileBatchRun(int32 firstEntry, int32 entryCount)
         const GUTileBatchEntry *tb = &gu_draw_queue[firstEntry + k].tileBatch;
         if (tb->vertCount < 2)
             continue;
+
+        // Never let a batch push the FINISH/END terminators out of the buffer.
+        if ((ge_cmd_ptr - ge_tri_cmd) > (GE_TRI_CMD_WORDS - GE_TRI_PER_BATCH - GE_TRI_RUN_FOOTER - 2))
+            break;
 
         const GUTexVertex *verts = &gu_tile_verts[tb->firstVert];
 
@@ -2910,7 +3041,7 @@ printf("Mania Pitch is %i",MANIA_PITCH);
       // ~1760 faces/frame = ~5300 verts on hardware. 6144 covers that at 73KB.
       // Only ~764KB is free after init, so a bigger buffer starves later
       // allocations -- 147KB here was enough to fail Init outright.
-      static const int32 wanted[] = { 6144, 4096, 3072, 2048 };
+      static const int32 wanted[] = { 16384, 12288, 8192, 6144, 4096, 3072, 2048 };
       // (tile quad buffer allocated just below)
       for (uint32 i = 0; i < sizeof(wanted) / sizeof(wanted[0]); ++i) {
           gu_face_verts = (GUFaceVertex *)memalign(16, sizeof(GUFaceVertex) * wanted[i]);
@@ -3171,7 +3302,7 @@ void GU_MarkRasterEnd()
 // memory stick every 60 frames is itself a multi-millisecond stall, so a
 // periodic report would manufacture the spikes it is meant to detect.
 #define GU_PACE_SPIKES    16
-#define GU_PACE_REPORT_AT 1800   // ~30s at 60fps
+#define GU_PACE_REPORT_AT 600    // reached in ~30s even at 20fps
 
 static int32 gu_paceBucket[5];
 static SceUInt64 gu_paceWorst = 0;
@@ -3250,7 +3381,7 @@ static void GU_UpdateFPSCounter()
         double dlistMs    = (double)gu_objDrawListUsecAccum / 1000.0 / frameCount;
         double flipMs     = (double)gu_flipUsecAccum / 1000.0 / frameCount;
 #if GU_ENABLE_PROFILING
-        FILE *f           = gu_paceReported ? fopen(GU_FPS_LOG, "w") : NULL;
+        FILE *f           = fopen(GU_FPS_LOG, "w");
         if (f) {
             fprintf(f, "%.2f fps\n", fps);
             fprintf(f, "frame %.2f ms = compute %.2f + idle(vblank) %.2f\n", frameMs, frameMs - vblankMs, vblankMs);
@@ -3287,7 +3418,7 @@ static void GU_UpdateFPSCounter()
         // logging tried earlier, which stalled the game to ~1fps.
         static int32 windowIndex = 0;
         if (windowIndex < 2000) {
-            FILE *h = gu_paceReported ? fopen("fps_history.log", "w") : NULL;
+            FILE *h = fopen("fps_history.log", windowIndex == 0 ? "w" : "a");
             if (h) {
                 fprintf(h, "%3d  %5.2f fps  frame %6.2f  cpu %6.2f  idle %6.2f  raster %6.2f  upd %6.2f  dlist %6.2f  flip %6.2f  other %6.2f  |  "
                            "spr %5.2f/%-5.1f  lay %5.2f  fill %5.2f/%-4.1f  face %5.2f/%-5.1f  bface %5.2f/%-5.1f  cout %5.2f/%-5.1f  rect %5.2f  "
@@ -3340,6 +3471,21 @@ static void GU_UpdateFPSCounter()
                 // inside ProcessObjectDrawLists and none of the draw-type
                 // counters above account for it.
                 {
+                    {
+                        extern SceUInt64 gu_dlSortUsec, gu_dlDrawUsec, gu_dlLayerUsec;
+                        extern int32 gu_dlEntityPeak, gu_dlDrawCalls;
+                        fprintf(h, "     face rejects/frame: range %.1f  bufferFull %.1f  inkOrVerts %.1f  (vert buffer %d)\n",
+                                (double)gu_faceRejectRange / frameCount, (double)gu_faceRejectFull / frameCount,
+                                (double)gu_faceRejectInk / frameCount, (int)gu_face_vert_max);
+                        gu_faceRejectRange = gu_faceRejectFull = gu_faceRejectInk = 0;
+                        fprintf(h, "     drawlist: sort %6.2f  entityDraw %6.2f  layers %6.2f  | peak list %d, draws/frame %.1f\n",
+                                (double)gu_dlSortUsec / 1000.0 / frameCount, (double)gu_dlDrawUsec / 1000.0 / frameCount,
+                                (double)gu_dlLayerUsec / 1000.0 / frameCount, (int)gu_dlEntityPeak,
+                                (double)gu_dlDrawCalls / frameCount);
+                        gu_dlSortUsec = gu_dlDrawUsec = gu_dlLayerUsec = 0;
+                        gu_dlEntityPeak = 0;
+                        gu_dlDrawCalls = 0;
+                    }
                     extern SceUInt64 gu_s3dMeshUsec, gu_s3dSortUsec, gu_s3dDrawUsec;
                     fprintf(h, "     scene3d: mesh(transform) %6.2f  sort %6.2f  draw %6.2f\n", (double)gu_s3dMeshUsec / 1000.0 / frameCount,
                             (double)gu_s3dSortUsec / 1000.0 / frameCount, (double)gu_s3dDrawUsec / 1000.0 / frameCount);

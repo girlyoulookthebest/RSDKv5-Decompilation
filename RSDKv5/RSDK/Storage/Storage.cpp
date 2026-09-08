@@ -26,6 +26,9 @@ enum {
 
 DataStorage RSDK::dataStorage[DATASET_MAX];
 
+// Diagnostic: log pool exhaustion, which is otherwise completely silent.
+#define RETRO_STORAGE_LOG 0
+
 bool32 RSDK::InitStorage()
 {
     // Storage limits.
@@ -172,6 +175,28 @@ void RSDK::AllocateStorage(void **dataPtr, uint32 size, StorageDataSets dataSet,
                     ++storage->entryCount;
                 }
             }
+
+            // A full pool leaves *data NULL and signals nothing, so the caller
+            // uses a null pointer -- for a model that means it silently draws
+            // nothing at all. Record it so the failure is visible.
+#if RETRO_STORAGE_LOG
+            if (*data == NULL) {
+                static int32 failCount = 0;
+                if (failCount < 32) {
+                    ++failCount;
+                    FILE *lf = fopen("storage_fail.log", failCount == 1 ? "w" : "a");
+                    if (lf) {
+                        static const char *setNames[] = { "STG", "MUS", "SFX", "STR", "TMP" };
+                        fprintf(lf, "FAILED %s size=%u  used=%u/%u bytes  entries=%d/%d\n",
+                                (unsigned)dataSet < 5 ? setNames[dataSet] : "?", (unsigned)size,
+                                (unsigned)(storage->usedStorage * sizeof(uint32)),
+                                (unsigned)storage->storageLimit,
+                                (int)storage->entryCount, (int)STORAGE_ENTRY_COUNT);
+                        fclose(lf);
+                    }
+                }
+            }
+#endif
 
             // If there are too many storage entries, then perform garbage collection.
             if (storage->entryCount >= STORAGE_ENTRY_COUNT)

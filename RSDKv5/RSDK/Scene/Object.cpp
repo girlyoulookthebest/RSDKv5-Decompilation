@@ -347,6 +347,11 @@ void RSDK::InitObjects()
 #include <psputils.h>
 SceUInt64 gu_objUpdateUsecAccum   = 0;
 SceUInt64 gu_objDrawListUsecAccum = 0;
+SceUInt64 gu_dlSortUsec = 0;    // draw-list depth sort
+SceUInt64 gu_dlDrawUsec = 0;    // entity Draw() callbacks
+SceUInt64 gu_dlLayerUsec = 0;   // ProcessParallax + layer queueing
+int32 gu_dlEntityPeak = 0;      // deepest sorted draw list seen
+int32 gu_dlDrawCalls = 0;       // entity Draw() calls
 #endif
 
 // ProcessObjects used to walk all ENTITY_COUNT (2368) slots three separate
@@ -785,20 +790,43 @@ void RSDK::ProcessObjectDrawLists()
                     if (list->hookCB)
                         list->hookCB();
 
+                    const SceUInt64 dlT0 = sceKernelGetSystemTimeWide();
                     if (list->sorted) {
-                        for (int32 e = 0; e < list->entityCount; ++e) {
-                            for (int32 i = list->entityCount - 1; i > e; --i) {
-                                int32 slot1 = list->entries[i - 1];
-                                int32 slot2 = list->entries[i];
-                                if (objectEntityList[slot2].zdepth > objectEntityList[slot1].zdepth) {
-                                    list->entries[i - 1] = slot2;
-                                    list->entries[i]     = slot1;
-                                }
+                        if (list->entityCount > gu_dlEntityPeak)
+                            gu_dlEntityPeak = list->entityCount;
+                        // This was a bubble sort: two nested loops with no early
+                        // exit, so it always ran entityCount^2 / 2 iterations and
+                        // every comparison chased a scattered read into
+                        // objectEntityList for zdepth -- a cache miss each time.
+                        // The Special Stage puts a few hundred decorations in one
+                        // sorted group, which was ~85ms/frame of the 114ms spent
+                        // in this function.
+                        //
+                        // Insertion sort is O(n) on nearly-sorted input, which is
+                        // what a draw list is frame to frame: entities keep their
+                        // relative depth order and only a few move. Same output as
+                        // the bubble sort -- descending zdepth, and stable, since
+                        // it stops on equal rather than swapping, so entities at
+                        // the same depth keep their original order. That matters:
+                        // reordering coplanar entities frame to frame flickers.
+                        for (int32 i = 1; i < list->entityCount; ++i) {
+                            const int32 slot  = list->entries[i];
+                            const int32 zdepth = objectEntityList[slot].zdepth;
+
+                            int32 j = i - 1;
+                            while (j >= 0 && objectEntityList[list->entries[j]].zdepth < zdepth) {
+                                list->entries[j + 1] = list->entries[j];
+                                --j;
                             }
+                            list->entries[j + 1] = slot;
                         }
                     }
 
+                    const SceUInt64 dlT1 = sceKernelGetSystemTimeWide();
+                    gu_dlSortUsec += dlT1 - dlT0;
+
                     for (int32 i = 0; i < list->entityCount; ++i) {
+                        ++gu_dlDrawCalls;
                         sceneInfo.entitySlot = list->entries[i];
                         validDraw            = false;
                         sceneInfo.entity     = &objectEntityList[list->entries[i]];
@@ -814,6 +842,9 @@ void RSDK::ProcessObjectDrawLists()
                             sceneInfo.entity->onScreen |= validDraw << sceneInfo.currentScreenID;
                         }
                     }
+
+                    const SceUInt64 dlT2 = sceKernelGetSystemTimeWide();
+                    gu_dlDrawUsec += dlT2 - dlT1;
 
                     for (int32 i = 0; i < list->layerCount; ++i) {
                         TileLayer *layer = &tileLayers[list->layerDrawList[i]];
@@ -841,6 +872,8 @@ void RSDK::ProcessObjectDrawLists()
                         }
 #endif
                     }
+
+                    gu_dlLayerUsec += sceKernelGetSystemTimeWide() - dlT2;
 
 #if RETRO_USE_MOD_LOADER
                     RunModCallbacks(MODCB_ONDRAW, INT_TO_VOID(l));

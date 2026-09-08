@@ -17,6 +17,15 @@ using namespace RSDK;
 //
 // Zero cost when profiling is off -- see GU_ENABLE_PROFILING.
 #include <psputils.h>
+#define RETRO_S3D_LOG 0
+int32 gu_s3dAccepted = 0;
+int32 gu_s3dDrawCalls = 0;
+int32 gu_s3dFacesSeen = 0;
+int32 gu_s3dPrepares = 0;
+uint8 gu_s3dSeen[64];
+int32 gu_s3dSeenVerts[64];
+int32 gu_s3dDropped  = 0;
+int32 gu_s3dDropLog  = 0;
 SceUInt64 gu_s3dMeshUsec = 0;  // per-vertex transform (AddMeshFrameToScene)
 SceUInt64 gu_s3dSortUsec = 0;  // depth sort
 SceUInt64 gu_s3dDrawUsec = 0;  // face rasterizing
@@ -408,6 +417,8 @@ void RSDK::MatrixInverse(Matrix *dest, Matrix *matrix)
     for (int32 i = 0; i < 0x10; ++i) dest->values[i / 4][i % 4] = (int32)inv[i];
 }
 
+#define RETRO_STORAGE_LOG 1
+
 uint16 RSDK::LoadMesh(const char *filename, uint8 scope)
 {
     if (!scope || scope > SCOPE_STAGE)
@@ -431,8 +442,13 @@ uint16 RSDK::LoadMesh(const char *filename, uint8 scope)
             break;
     }
 
-    if (id >= MODEL_COUNT)
+    if (id >= MODEL_COUNT) {
+#if RETRO_STORAGE_LOG
+        FILE *mf = fopen("mesh_load.log", "a");
+        if (mf) { fprintf(mf, "NO SLOT for %s (MODEL_COUNT=%d)\n", fullFilePath, (int)MODEL_COUNT); fclose(mf); }
+#endif
         return -1;
+    }
 
     Model *model = &modelList[id];
     FileInfo info;
@@ -455,6 +471,17 @@ uint16 RSDK::LoadMesh(const char *filename, uint8 scope)
         model->frameCount = ReadInt16(&info);
 
         AllocateStorage((void **)&model->vertices, sizeof(ModelVertex) * model->vertCount * model->frameCount, DATASET_STG, true);
+#if RETRO_STORAGE_LOG
+        {
+            FILE *mf = fopen("mesh_load.log", "a");
+            if (mf) {
+                fprintf(mf, "id=%-3d %-28s verts=%d frames=%d indices=%d  vertices=%s\n", (int)id, filename,
+                        (int)model->vertCount, (int)model->frameCount, (int)model->indexCount,
+                        model->vertices ? "ok" : "*** NULL ***");
+                fclose(mf);
+            }
+        }
+#endif
         if (model->flags & MODEL_USETEXTURES)
             AllocateStorage((void **)&model->texCoords, sizeof(TexCoord) * model->vertCount, DATASET_STG, true);
         if (model->flags & MODEL_USECOLOURS)
@@ -614,6 +641,26 @@ void RSDK::AddModelToScene(uint16 modelFrames, uint16 sceneIndex, uint8 drawMode
             int32 vertID          = scn->vertexCount;
             uint8 *faceVertCounts = &scn->faceVertCounts[scn->faceCount];
             int32 indCnt          = mdl->indexCount;
+#if RETRO_S3D_LOG
+            if (modelFrames < 64) {
+                gu_s3dSeen[modelFrames] |= 1;
+                gu_s3dSeenVerts[modelFrames] = indCnt;
+            }
+            if (scn->vertLimit - vertID < indCnt) {
+                ++gu_s3dDropped;
+                if (gu_s3dDropLog < 24) {
+                    ++gu_s3dDropLog;
+                    FILE *df = fopen("s3d_drop.log", gu_s3dDropLog == 1 ? "w" : "a");
+                    if (df) {
+                        fprintf(df, "DROPPED model verts=%d  scene used %d/%d  faces=%d\n",
+                                (int)indCnt, (int)vertID, (int)scn->vertLimit, (int)scn->faceCount);
+                        fclose(df);
+                    }
+                }
+            }
+            else
+                ++gu_s3dAccepted;
+#endif
             if (scn->vertLimit - vertID >= indCnt) {
                 scn->vertexCount += mdl->indexCount;
                 scn->drawMode = drawMode;
@@ -809,6 +856,26 @@ void RSDK::AddMeshFrameToScene(uint16 modelFrames, uint16 sceneIndex, Animator *
             int32 vertID          = scn->vertexCount;
             uint8 *faceVertCounts = &scn->faceVertCounts[scn->faceCount];
             int32 indCnt          = mdl->indexCount;
+#if RETRO_S3D_LOG
+            if (modelFrames < 64) {
+                gu_s3dSeen[modelFrames] |= 1;
+                gu_s3dSeenVerts[modelFrames] = indCnt;
+            }
+            if (scn->vertLimit - vertID < indCnt) {
+                ++gu_s3dDropped;
+                if (gu_s3dDropLog < 24) {
+                    ++gu_s3dDropLog;
+                    FILE *df = fopen("s3d_drop.log", gu_s3dDropLog == 1 ? "w" : "a");
+                    if (df) {
+                        fprintf(df, "DROPPED model verts=%d  scene used %d/%d  faces=%d\n",
+                                (int)indCnt, (int)vertID, (int)scn->vertLimit, (int)scn->faceCount);
+                        fclose(df);
+                    }
+                }
+            }
+            else
+                ++gu_s3dAccepted;
+#endif
             if (scn->vertLimit - vertID >= indCnt) {
                 scn->vertexCount += mdl->indexCount;
                 scn->drawMode = drawMode;
@@ -990,6 +1057,10 @@ void RSDK::Draw3DScene(uint16 sceneID)
         const int32 s3dPosX = currentScreen->position.x, s3dPosY = currentScreen->position.y;
 
 
+#if RETRO_S3D_LOG
+        ++gu_s3dDrawCalls;
+        gu_s3dFacesSeen += scn->faceCount;
+#endif
         // Setup face buffer.
         // Each face's depth is an average of the depth of its vertices.
         Scene3DVertex *vertices = scn->vertices;
@@ -1033,6 +1104,30 @@ void RSDK::Draw3DScene(uint16 sceneID)
             ++faceBuffer;
             ++faceVertCounts;
         }
+
+#if RETRO_S3D_LOG
+        {
+            static int32 rpt = 0;
+            static int32 peakVerts = 0, peakFaces = 0;
+            if (scn->vertexCount > peakVerts) peakVerts = scn->vertexCount;
+            if (scn->faceCount > peakFaces)   peakFaces = scn->faceCount;
+            if (++rpt == 300) {
+                FILE *sf = fopen("s3d_usage.log", "w");
+                if (sf) {
+                    fprintf(sf, "over 300 frames: peak verts %d / limit %d   peak faces %d\n",
+                            (int)peakVerts, (int)scn->vertLimit, (int)peakFaces);
+                    fprintf(sf, "models accepted %d, dropped %d\n", (int)gu_s3dAccepted, (int)gu_s3dDropped);
+                    fprintf(sf, "Draw3DScene calls %d, Prepare3DScene calls %d, faces processed %d\n",
+                            (int)gu_s3dDrawCalls, (int)gu_s3dPrepares, (int)gu_s3dFacesSeen);
+                    fprintf(sf, "\nmodel ids submitted to a 3D scene (id : indexCount):\n");
+                    for (int32 mi = 0; mi < 64; ++mi)
+                        if (gu_s3dSeen[mi])
+                            fprintf(sf, "  %2d : %d\n", (int)mi, (int)gu_s3dSeenVerts[mi]);
+                    fclose(sf);
+                }
+            }
+        }
+#endif
 
         // Sort the face buffer back-to-front, so faces don't overlap each other
         // incorrectly when rendered.

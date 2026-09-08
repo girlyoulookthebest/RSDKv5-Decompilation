@@ -151,13 +151,31 @@ inline void Prepare3DScene(uint16 sceneID)
     if (sceneID < SCENE3D_COUNT) {
         Scene3D *scn = &scene3DList[sceneID];
 
+        // Clear only the region the previous use actually touched, not the
+        // whole 4096-entry capacity.
+        //
+        // The buffers are allocated zeroed and every clear restores that, so
+        // everything outside the previously-used range is already zero -- the
+        // full-capacity memset was re-zeroing memory that was never written.
+        // It came to ~230KB per call, and UFO_Decoration_Draw calls this once
+        // per decoration: with ~30 decorations on screen that was ~7MB of
+        // memset per frame, which is most of the Special Stage's frame time.
+        // Harmless on desktop, fatal at PSP memory bandwidth.
+        const int32 usedVerts = scn->vertexCount;
+        const int32 usedFaces = scn->faceCount;
+
         scn->vertexCount = 0;
         scn->faceCount   = 0;
 
-        memset(scn->vertices, 0, sizeof(Scene3DVertex) * scn->vertLimit);
-        memset(scn->normals, 0, sizeof(Scene3DVertex) * scn->vertLimit);
-        memset(scn->faceVertCounts, 0, sizeof(uint8) * scn->vertLimit);
-        memset(scn->faceBuffer, 0, sizeof(Scene3DFace) * scn->vertLimit);
+        if (usedVerts > 0) {
+            memset(scn->vertices, 0, sizeof(Scene3DVertex) * usedVerts);
+            memset(scn->normals, 0, sizeof(Scene3DVertex) * usedVerts);
+        }
+
+        if (usedFaces > 0) {
+            memset(scn->faceVertCounts, 0, sizeof(uint8) * usedFaces);
+            memset(scn->faceBuffer, 0, sizeof(Scene3DFace) * usedFaces);
+        }
     }
 }
 
