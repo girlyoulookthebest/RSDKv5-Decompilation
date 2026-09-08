@@ -558,6 +558,7 @@ struct GUFaceVertex {
 #define GU_TILE_ATLAS_TEST 0
 #define GU_FB_DUMP    0
 #define GU_VRAM_BENCH 0
+#define GU_XFORM_BENCH 0
 
 // Rasterize straight into VRAM instead of main RAM. The GE cannot render into
 // main RAM, so every GPU batch previously copied the framebuffer up to VRAM
@@ -858,7 +859,7 @@ static uint32 gu_profCount[GU_ENTRY_TYPE_COUNT];
 // (it's a handful of sceKernelGetSystemTimeWide calls per frame, far below
 // measurement noise) so turning this back on is the only step needed to
 // profile again.
-#define GU_ENABLE_PROFILING 1
+#define GU_ENABLE_PROFILING 0
 
 // Runtime mirror of the switch above, so the Scene3D timers (in another
 // translation unit) can gate on it without needing the macro. With profiling
@@ -2844,6 +2845,87 @@ static void GU_VramWriteBench()
 }
 #endif
 
+#if GU_XFORM_BENCH
+// Ground truth for the Scene3D vertex cost. In game the transform works out at
+// ~4us per vertex, which is roughly fifteen times what nine multiplies and nine
+// adds should cost, and the projection phase comes out the same. This runs the
+// identical arithmetic over a scratch buffer to separate the maths from
+// whatever the in-game version is really waiting on.
+//
+// Three variants:
+//   packed    - 12-byte source, 12-byte destination, sequential
+//   scene     - 40-byte destination, matching Scene3DVertex
+//   indexed   - 40-byte destination read through an index array, as the real
+//               loop does (mdl->vertices[indices[i]])
+struct BenchModelVert { int32 x, y, z; };
+struct BenchSceneVert { int32 x, y, z, nx, ny, nz, tx, ty; uint32 color; };
+
+static void GU_XformBench()
+{
+    const int32 N = 4096;
+    BenchModelVert *src = (BenchModelVert *)malloc(sizeof(BenchModelVert) * N);
+    BenchSceneVert *dst = (BenchSceneVert *)malloc(sizeof(BenchSceneVert) * N);
+    int32 *idx          = (int32 *)malloc(sizeof(int32) * N);
+    BenchModelVert *dstPacked = (BenchModelVert *)malloc(sizeof(BenchModelVert) * N);
+    if (!src || !dst || !idx || !dstPacked)
+        return;
+
+    for (int32 i = 0; i < N; ++i) {
+        src[i].x = i * 37;  src[i].y = i * 11;  src[i].z = i * 53;
+        idx[i]   = (i * 2654435761u) % N;   // scattered, like a real index list
+    }
+
+    const int32 m00 = 256, m01 = 0, m02 = 0, m03 = 100;
+    const int32 m10 = 0, m11 = 256, m12 = 0, m13 = 200;
+    const int32 m20 = 0, m21 = 0, m22 = 256, m23 = 300;
+
+    SceUInt64 t0, tPacked, tScene, tIndexed;
+    const int32 reps = 8;
+
+    t0 = sceKernelGetSystemTimeWide();
+    for (int32 r = 0; r < reps; ++r)
+        for (int32 i = 0; i < N; ++i) {
+            dstPacked[i].x = m03 + (m00 * src[i].x >> 8) + (src[i].y * m01 >> 8) + (src[i].z * m02 >> 8);
+            dstPacked[i].y = m13 + (src[i].z * m12 >> 8) + (m10 * src[i].x >> 8) + (src[i].y * m11 >> 8);
+            dstPacked[i].z = m23 + (m22 * src[i].z >> 8) + (src[i].y * m21 >> 8) + (src[i].x * m20 >> 8);
+        }
+    tPacked = sceKernelGetSystemTimeWide() - t0;
+
+    t0 = sceKernelGetSystemTimeWide();
+    for (int32 r = 0; r < reps; ++r)
+        for (int32 i = 0; i < N; ++i) {
+            dst[i].x = m03 + (m00 * src[i].x >> 8) + (src[i].y * m01 >> 8) + (src[i].z * m02 >> 8);
+            dst[i].y = m13 + (src[i].z * m12 >> 8) + (m10 * src[i].x >> 8) + (src[i].y * m11 >> 8);
+            dst[i].z = m23 + (m22 * src[i].z >> 8) + (src[i].y * m21 >> 8) + (src[i].x * m20 >> 8);
+        }
+    tScene = sceKernelGetSystemTimeWide() - t0;
+
+    t0 = sceKernelGetSystemTimeWide();
+    for (int32 r = 0; r < reps; ++r)
+        for (int32 i = 0; i < N; ++i) {
+            const BenchModelVert *sv = &src[idx[i]];
+            dst[i].x = m03 + (m00 * sv->x >> 8) + (sv->y * m01 >> 8) + (sv->z * m02 >> 8);
+            dst[i].y = m13 + (sv->z * m12 >> 8) + (m10 * sv->x >> 8) + (sv->y * m11 >> 8);
+            dst[i].z = m23 + (m22 * sv->z >> 8) + (sv->y * m21 >> 8) + (sv->x * m20 >> 8);
+        }
+    tIndexed = sceKernelGetSystemTimeWide() - t0;
+
+    FILE *bf = fopen("xform_bench.log", "w");
+    if (bf) {
+        const double per = 1000.0 / (double)(N * reps); // usec -> nsec per vertex
+        fprintf(bf, "transform cost per vertex, %d verts x %d reps\n\n", (int)N, (int)reps);
+        fprintf(bf, "  packed  12B dst, sequential : %7.1f ns\n", (double)tPacked * per);
+        fprintf(bf, "  scene   40B dst, sequential : %7.1f ns\n", (double)tScene * per);
+        fprintf(bf, "  scene   40B dst, indexed src: %7.1f ns\n", (double)tIndexed * per);
+        fprintf(bf, "\nin game the transform measures ~4100 ns/vertex\n");
+        fprintf(bf, "cpu %d MHz\n", scePowerGetCpuClockFrequencyInt());
+        fclose(bf);
+    }
+
+    free(src); free(dst); free(idx); free(dstPacked);
+}
+#endif
+
 bool RenderDevice::Init()
 {//This is just gpSP display code atm...
   // The PSP boots at a conservative default clock unless a game explicitly asks
@@ -3089,6 +3171,9 @@ printf("Mania Pitch is %i",MANIA_PITCH);
 
 #if GU_VRAM_BENCH
   GU_VramWriteBench();
+#endif
+#if GU_XFORM_BENCH
+  GU_XformBench();
 #endif
 
   if (!AudioDevice::Init())
@@ -3499,6 +3584,13 @@ static void GU_UpdateFPSCounter()
                             gu_s3dModeCalls[m] = 0;
                             gu_s3dModeFaces[m] = 0;
                         }
+                    }
+                    {
+                        extern int32 gu_s3dVertsXf, gu_s3dFacesIn, gu_s3dFacesNear;
+                        fprintf(h, "     geometry/frame: verts transformed %.0f  faces %.0f  of which dropped near-plane %.0f\n",
+                                (double)gu_s3dVertsXf / frameCount, (double)gu_s3dFacesIn / frameCount,
+                                (double)gu_s3dFacesNear / frameCount);
+                        gu_s3dVertsXf = gu_s3dFacesIn = gu_s3dFacesNear = 0;
                     }
                     extern SceUInt64 gu_s3dMeshUsec, gu_s3dSortUsec, gu_s3dDrawUsec;
                     fprintf(h, "     scene3d: mesh(transform) %6.2f  sort %6.2f  draw %6.2f\n", (double)gu_s3dMeshUsec / 1000.0 / frameCount,
