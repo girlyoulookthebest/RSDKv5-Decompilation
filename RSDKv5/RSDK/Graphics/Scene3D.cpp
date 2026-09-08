@@ -26,6 +26,11 @@ uint8 gu_s3dSeen[64];
 int32 gu_s3dSeenVerts[64];
 int32 gu_s3dDropped  = 0;
 int32 gu_s3dDropLog  = 0;
+#define S3D_SPLIT_DRAW 0
+int32 gu_s3dModeCounter = 0;
+SceUInt64 gu_s3dModeUsec[3] = { 0, 0, 0 };
+int32 gu_s3dModeCalls[3] = { 0, 0, 0 };
+int32 gu_s3dModeFaces[3] = { 0, 0, 0 };
 SceUInt64 gu_s3dMeshUsec = 0;  // per-vertex transform (AddMeshFrameToScene)
 SceUInt64 gu_s3dSortUsec = 0;  // depth sort
 SceUInt64 gu_s3dDrawUsec = 0;  // face rasterizing
@@ -1142,7 +1147,14 @@ void RSDK::Draw3DScene(uint16 sceneID)
         // monotonically with face order, so tie-breaking on it reproduces the
         // insertion sort's ordering for equal depths exactly -- important
         // because coplanar faces reordering frame to frame would shimmer.
+#if S3D_SPLIT_DRAW
+        const int32 s3dMode = (gu_s3dModeCounter++) % 3;
+        const SceUInt64 s3dSplitT0 = sceKernelGetSystemTimeWide();
+#endif
         S3D_TIME_BEGIN(gu_s3dSortUsec);
+#if S3D_SPLIT_DRAW
+        if (s3dMode != 2)
+#endif
         std::sort(scn->faceBuffer, scn->faceBuffer + scn->faceCount, [](const Scene3DFace &a, const Scene3DFace &b) {
             if (a.depth != b.depth)
                 return a.depth > b.depth; // farthest first
@@ -1482,6 +1494,12 @@ void RSDK::Draw3DScene(uint16 sceneID)
                             vertPos[v].x = (s3dCenterX << 16) + ((drawVert[v].x << s3dProjX) / vertZ << 16);
                             vertPos[v].y = (s3dCenterY << 16) - ((drawVert[v].y << s3dProjY) / vertZ << 16);
 
+#if S3D_SPLIT_DRAW
+                            if (s3dMode == 1) {
+                                vertClrs[v] = drawVert[v].color;
+                                continue;
+                            }
+#endif
                             int32 normal    = drawVert[v].ny;
                             int32 normalVal = (normal >> 2) * (abs(normal) >> 2);
 
@@ -1539,5 +1557,10 @@ void RSDK::Draw3DScene(uint16 sceneID)
                 break;
         }
         S3D_TIME_END(gu_s3dDrawUsec);
+#if S3D_SPLIT_DRAW
+        gu_s3dModeUsec[s3dMode] += sceKernelGetSystemTimeWide() - s3dSplitT0;
+        ++gu_s3dModeCalls[s3dMode];
+        gu_s3dModeFaces[s3dMode] += scn->faceCount;
+#endif
     }
 }

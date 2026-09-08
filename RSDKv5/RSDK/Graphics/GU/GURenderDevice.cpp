@@ -609,7 +609,7 @@ struct GUFaceVertex {
 // per-band batches would cost more than the CPU rasterizer.
 #define GU_TILE_MAX_BANDS  8
 // Diagnostic: hold L to route layers back to the CPU rasterizer for a live A/B.
-#define GU_TILE_PAD_TOGGLE 1
+#define GU_TILE_PAD_TOGGLE 0
 static u8 *gu_tile_atlas       = NULL;
 static int32 gu_tile_atlas_ok  = 0;
 static int32 gu_atlas_scene    = -1; // listPos the atlas was built for
@@ -3485,6 +3485,20 @@ static void GU_UpdateFPSCounter()
                         gu_dlSortUsec = gu_dlDrawUsec = gu_dlLayerUsec = 0;
                         gu_dlEntityPeak = 0;
                         gu_dlDrawCalls = 0;
+                    }
+                    {
+                        extern SceUInt64 gu_s3dModeUsec[3];
+                        extern int32 gu_s3dModeCalls[3], gu_s3dModeFaces[3];
+                        static const char *modeName[3] = { "normal    ", "no shading", "no sort   " };
+                        for (int32 m = 0; m < 3; ++m)
+                            fprintf(h, "     s3d %s: %8.2f us/1000 faces  (%d calls, %d faces)\n", modeName[m],
+                                    gu_s3dModeFaces[m] ? (double)gu_s3dModeUsec[m] * 1000.0 / gu_s3dModeFaces[m] : 0.0,
+                                    (int)gu_s3dModeCalls[m], (int)gu_s3dModeFaces[m]);
+                        for (int32 m = 0; m < 3; ++m) {
+                            gu_s3dModeUsec[m] = 0;
+                            gu_s3dModeCalls[m] = 0;
+                            gu_s3dModeFaces[m] = 0;
+                        }
                     }
                     extern SceUInt64 gu_s3dMeshUsec, gu_s3dSortUsec, gu_s3dDrawUsec;
                     fprintf(h, "     scene3d: mesh(transform) %6.2f  sort %6.2f  draw %6.2f\n", (double)gu_s3dMeshUsec / 1000.0 / frameCount,
