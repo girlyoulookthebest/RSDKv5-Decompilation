@@ -85,9 +85,9 @@ struct Scene3DVertex {
     int32 ny;
     int32 nz;
 
-    int32 tx;
-    int32 ty;
-
+    // No tx/ty: nothing in the engine or the game ever read them. Removing
+    // them takes this struct from 36 to 28 bytes. Texture coordinates for a
+    // model live in Model::texCoords, which is unrelated to this.
     uint32 color;
 };
 
@@ -99,7 +99,10 @@ struct Scene3DFace {
 struct Scene3D {
     RETRO_HASH_MD5(hash);
     Scene3DVertex *vertices;
-    Scene3DVertex *normals;
+    // No normals array: it was allocated at full vertLimit and cleared on every
+    // Prepare3DScene, but nothing ever wrote or read it. Per-vertex normals
+    // live in Scene3DVertex itself (nx/ny/nz), which is what the shaded draw
+    // modes actually use.
     Scene3DFace *faceBuffer;
     uint8 *faceVertCounts;
 
@@ -167,10 +170,8 @@ inline void Prepare3DScene(uint16 sceneID)
         scn->vertexCount = 0;
         scn->faceCount   = 0;
 
-        if (usedVerts > 0) {
+        if (usedVerts > 0)
             memset(scn->vertices, 0, sizeof(Scene3DVertex) * usedVerts);
-            memset(scn->normals, 0, sizeof(Scene3DVertex) * usedVerts);
-        }
 
         if (usedFaces > 0) {
             memset(scn->faceVertCounts, 0, sizeof(uint8) * usedFaces);

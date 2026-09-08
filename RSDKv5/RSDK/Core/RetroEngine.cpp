@@ -5,7 +5,7 @@ using namespace RSDK;
 // Development shortcut: boot straight into a stage. -1 disables it (normal
 // builds). Category indices match the dev menu's stage list; 3 is the
 // Special Stage. See where these are applied in LoadGameConfig below.
-#define RETRO_BOOT_CATEGORY -1
+#define RETRO_BOOT_CATEGORY 3
 #define RETRO_BOOT_SCENE    0
 
 #if RETRO_REV0U

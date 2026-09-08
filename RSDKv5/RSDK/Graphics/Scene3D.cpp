@@ -31,6 +31,9 @@ int32 gu_s3dModeCounter = 0;
 SceUInt64 gu_s3dModeUsec[3] = { 0, 0, 0 };
 int32 gu_s3dModeCalls[3] = { 0, 0, 0 };
 int32 gu_s3dModeFaces[3] = { 0, 0, 0 };
+int32 gu_s3dVertsXf   = 0;  // vertices put through the transform
+int32 gu_s3dFacesIn   = 0;  // faces reaching the draw phase
+int32 gu_s3dFacesNear = 0;  // faces dropped by the vertZ < 0x100 test
 SceUInt64 gu_s3dMeshUsec = 0;  // per-vertex transform (AddMeshFrameToScene)
 SceUInt64 gu_s3dSortUsec = 0;  // depth sort
 SceUInt64 gu_s3dDrawUsec = 0;  // face rasterizing
@@ -583,7 +586,6 @@ uint16 RSDK::Create3DScene(const char *name, uint16 vertexLimit, uint8 scope)
     scene->projectionX = 8;
     scene->projectionY = 8;
     AllocateStorage((void **)&scene->vertices, sizeof(Scene3DVertex) * vertexLimit, DATASET_STG, true);
-    AllocateStorage((void **)&scene->normals, sizeof(Scene3DVertex) * vertexLimit, DATASET_STG, true);
     AllocateStorage((void **)&scene->faceVertCounts, sizeof(uint8) * vertexLimit, DATASET_STG, true);
     AllocateStorage((void **)&scene->faceBuffer, sizeof(Scene3DFace) * vertexLimit, DATASET_STG, true);
 
@@ -668,6 +670,7 @@ void RSDK::AddModelToScene(uint16 modelFrames, uint16 sceneIndex, uint8 drawMode
 #endif
             if (scn->vertLimit - vertID >= indCnt) {
                 scn->vertexCount += mdl->indexCount;
+                gu_s3dVertsXf += mdl->indexCount;
                 scn->drawMode = drawMode;
                 scn->faceCount += indCnt / mdl->faceVertCount;
 
@@ -883,6 +886,7 @@ void RSDK::AddMeshFrameToScene(uint16 modelFrames, uint16 sceneIndex, Animator *
 #endif
             if (scn->vertLimit - vertID >= indCnt) {
                 scn->vertexCount += mdl->indexCount;
+                gu_s3dVertsXf += mdl->indexCount;
                 scn->drawMode = drawMode;
                 scn->faceCount += indCnt / mdl->faceVertCount;
 
@@ -1483,6 +1487,7 @@ void RSDK::Draw3DScene(uint16 sceneID)
                 for (int32 f = 0; f < scn->faceCount; ++f) {
                     Scene3DVertex *drawVert = &scn->vertices[scn->faceBuffer[f].index];
                     int32 vertCount         = *vertCnt;
+                    ++gu_s3dFacesIn;
 
                     int32 v = 0;
                     for (; v < vertCount && v < 0xFF; ++v) {
