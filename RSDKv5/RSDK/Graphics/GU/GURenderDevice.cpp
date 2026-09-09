@@ -889,7 +889,7 @@ static uint32 gu_profCount[GU_ENTRY_TYPE_COUNT];
 // (it's a handful of sceKernelGetSystemTimeWide calls per frame, far below
 // measurement noise) so turning this back on is the only step needed to
 // profile again.
-#define GU_ENABLE_PROFILING 1
+#define GU_ENABLE_PROFILING 0
 
 // Runtime mirror of the switch above, so the Scene3D timers (in another
 // translation unit) can gate on it without needing the macro. With profiling
