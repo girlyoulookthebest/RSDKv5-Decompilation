@@ -89,6 +89,19 @@ using namespace RSDK;
 #define GE_CMD_TSIZE0 0xB8
 #define GE_CMD_TFLUSH 0xCB
 #define GE_CMD_TSYNC  0xCC
+#define GE_CMD_ZBP    0x9E
+#define GE_CMD_ZBW    0x9F
+#define GE_CMD_ZTST   0xDE
+#define GE_CMD_MINZ   0xD6
+#define GE_CMD_MAXZ   0xD7
+#define GE_CMD_PMSKC  0xE8
+
+// Depth-test the 3D faces on the GE instead of depth-sorting them on the CPU.
+// Measured on hardware, the sort costs about 17% of the sort+draw phase -- part
+// the sort itself, part the scattered vertex reads its reordering causes.
+#define GU_GPU_DEPTH 1
+#define GU_DEPTH_FAR   32767
+#define GU_DEPTH_SHIFT 4   // face depths measured at 8049..411853 on hardware
 #define GE_CMD_CLEAR  0xD3
 #define GE_CMD_VTYPE  0x12
 #define GE_CMD_BASE   0x10
@@ -277,6 +290,17 @@ static u32 screen_pitch = 424;
 // VRAM copy per sheet the first time it's drawn through the fast path.
 // Sits in the VRAM left over after screen_texture; see Init() for the
 // actual base/size (computed from real addresses, not guessed constants).
+#if GU_GPU_DEPTH
+// Sits in the safety margin already reserved past the sprite arena, so it does
+// not displace anything. Same stride as the render target.
+static u16 *gu_depth_buffer  = NULL;
+static bool gu_depthCleared  = false;
+#endif
+#if GU_GPU_DEPTH
+// Set by Draw3DScene for each face just before it is emitted; the draw call
+// itself has no depth parameter to pass it through.
+int32 gu_faceDepth = 0;
+#endif
 static u8 *gu_tex_arena      = NULL;
 static u32 gu_tex_arena_size = 0;
 static u32 gu_tex_arena_used = 0;
@@ -704,6 +728,12 @@ struct GUTexVertex {
     s16 u, v;
     s16 x, y, z;
 };
+
+#if GU_GPU_DEPTH
+// Screen-filling quad at the far depth, used to reset the depth buffer once a
+// frame. Declared here because it needs GUTexVertex above.
+static GUTexVertex __attribute__((aligned(16))) gu_depthClearVerts[2];
+#endif
 
 // Repacks tilesetPixels into the atlas. Tile N lands at column N&31, row N>>5.
 //
@@ -1743,7 +1773,16 @@ void GU_QueueBlendedFaceDraw(Vector2 *vertices, uint32 *colors, int32 vertCount,
                 v->color          = 0xFF000000u | ((c & 0xFF) << 16) | (c & 0xFF00) | ((c >> 16) & 0xFF);
                 v->x              = (s16)(vertices[s].x >> 16);
                 v->y              = (s16)(vertices[s].y >> 16);
+#if GU_GPU_DEPTH
+                {
+                    int32 dz = gu_faceDepth >> GU_DEPTH_SHIFT;
+                    if (dz < 0) dz = 0;
+                    if (dz > GU_DEPTH_FAR) dz = GU_DEPTH_FAR;
+                    v->z = (s16)dz;
+                }
+#else
                 v->z              = 0;
+#endif
                 v->pad            = 0;
             }
             b->faceBatch.vertCount += needed;
@@ -1990,6 +2029,9 @@ void GU_FlushDrawQueue()
     if (gu_draw_queue_count > gu_queuePeak)
         gu_queuePeak = gu_draw_queue_count;
 
+#if GU_GPU_DEPTH
+    gu_depthCleared = false;
+#endif
     gu_face_vert_count   = 0;
     gu_tile_vert_count   = 0;
     gu_draw_queue_count  = 0;
@@ -2184,8 +2226,41 @@ static void GU_DrawFaceBatch(int32 firstVert, int32 vertCount)
     GE_CMD(ATE, 0);
     GE_CMD(ZTE, 0);
     GE_CMD(ZMSK, 1);
-    GE_CMD(CULLE, 0); // faces arrive in both windings -- Draw3DScene depth-sorts
+    GE_CMD(CULLE, 0); // faces arrive in both windings
     GE_CMD(SHADE, 1); // gouraud (0x50 -- 0x1C is GU_LIGHT1, see the note above)
+
+#if GU_GPU_DEPTH
+    if (gu_depth_buffer) {
+        const u32 zt = (u32)gu_depth_buffer | 0x40000000; // uncached, as with the colour target
+
+        // Clearing 215KB a frame would cost more than the sort this replaces,
+        // so it is done as a GE pass instead: one full-screen sprite at the far
+        // depth with the test forced to pass, colour writes masked off.
+        if (!gu_depthCleared) {
+            gu_depthCleared = true;
+            GE_CMD(ZBP, zt & 0x00FFFFFF);
+            GE_CMD(ZBW, ((zt & 0xFF000000) >> 8) | pitch);
+            GE_CMD(MINZ, 0);
+            GE_CMD(MAXZ, 65535);
+            GE_CMD(ZTE, 1);
+            GE_CMD(ZTST, 1);   // GU_ALWAYS
+            GE_CMD(ZMSK, 0);   // depth writes on
+            GE_CMD(PMSKC, 0x00FFFFFF); // no colour writes
+            GE_CMD(TME, 0);
+            GE_CMD(VTYPE, (1 << 23) | (2 << 7) | 2);
+            GE_CMD(BASE, ((u32)gu_depthClearVerts & 0xFF000000) >> 8);
+            GE_CMD(VADDR, (u32)gu_depthClearVerts & 0x00FFFFFF);
+            GE_CMD(PRIM, (6 << 16) | 2); // GU_SPRITES
+            GE_CMD(PMSKC, 0);            // colour writes back on
+        }
+
+        GE_CMD(ZBP, zt & 0x00FFFFFF);
+        GE_CMD(ZBW, ((zt & 0xFF000000) >> 8) | pitch);
+        GE_CMD(ZTE, 1);
+        GE_CMD(ZTST, 5);   // GU_LEQUAL (5; 6 is GU_GREATER) -- nearer wins
+        GE_CMD(ZMSK, 0);   // depth writes on
+    }
+#endif
 
     GE_CMD(SCISSOR1, 0);
     GE_CMD(SCISSOR2, ((MANIA_HEIGHT - 1) << 10) | (MANIA_WIDTH - 1));
@@ -2196,6 +2271,10 @@ static void GU_DrawFaceBatch(int32 firstVert, int32 vertCount)
     GE_CMD(PRIM, (3 << 16) | vertCount);
 
     // Restore what FlipScreen's present list assumes but never sets.
+#if GU_GPU_DEPTH
+    GE_CMD(ZTE, 0);
+    GE_CMD(ZMSK, 1);
+#endif
     GE_CMD(TME, 1);
     GE_CMD(SCISSOR1, 0);
     GE_CMD(SCISSOR2, (PSP_SCREEN_HEIGHT << 10) | PSP_SCREEN_WIDTH);
@@ -3108,6 +3187,26 @@ printf("Mania Pitch is %i",MANIA_PITCH);
                                ? (u32)(vramTotal - usedBefore - safetyMargin)
                                : 0;
       gu_tex_arena_used = 0;
+
+#if GU_GPU_DEPTH
+      // Two corners of a screen-filling sprite at the far depth.
+      gu_depthClearVerts[0].u = 0; gu_depthClearVerts[0].v = 0;
+      gu_depthClearVerts[0].x = 0; gu_depthClearVerts[0].y = 0;
+      gu_depthClearVerts[0].z = GU_DEPTH_FAR;
+      gu_depthClearVerts[1].u = 0; gu_depthClearVerts[1].v = 0;
+      gu_depthClearVerts[1].x = MANIA_WIDTH; gu_depthClearVerts[1].y = MANIA_HEIGHT;
+      gu_depthClearVerts[1].z = GU_DEPTH_FAR;
+
+      // Carve the depth buffer out of the margin rather than the arena, so the
+      // GPU sprite path keeps the space it expects.
+      {
+          const size_t depthBytes = (size_t)MANIA_HEIGHT * screens[0].pitch * sizeof(u16);
+          if (gu_tex_arena_size > depthBytes + 4096) {
+              gu_tex_arena_size -= (u32)depthBytes;
+              gu_depth_buffer = (u16 *)(gu_tex_arena + gu_tex_arena_size);
+          }
+      }
+#endif
   }
 
 
@@ -3586,6 +3685,11 @@ static void GU_UpdateFPSCounter()
                         }
                     }
                     {
+                        {
+                            extern int32 gu_s3dDepthMin, gu_s3dDepthMax;
+                            fprintf(h, "     face depth range: %d .. %d  (vertex z is s16, so 0..32767)\n",
+                                    (int)gu_s3dDepthMin, (int)gu_s3dDepthMax);
+                        }
                         extern int32 gu_s3dVertsXf, gu_s3dFacesIn, gu_s3dFacesNear;
                         fprintf(h, "     geometry/frame: verts transformed %.0f  faces %.0f  of which dropped near-plane %.0f\n",
                                 (double)gu_s3dVertsXf / frameCount, (double)gu_s3dFacesIn / frameCount,

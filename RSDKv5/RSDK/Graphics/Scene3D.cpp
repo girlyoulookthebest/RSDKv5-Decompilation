@@ -31,6 +31,15 @@ int32 gu_s3dModeCounter = 0;
 SceUInt64 gu_s3dModeUsec[3] = { 0, 0, 0 };
 int32 gu_s3dModeCalls[3] = { 0, 0, 0 };
 int32 gu_s3dModeFaces[3] = { 0, 0, 0 };
+// The GE depth-tests these faces now, so the CPU sort is redundant. Set to 1
+// to put it back if depth precision ever proves insufficient.
+#define GU_S3D_KEEP_SORT 0
+#define S3D_DEPTH_PROBE 1
+int32 gu_s3dDepthMin = 0x7FFFFFFF;
+int32 gu_s3dDepthMax = -0x7FFFFFFF;
+#if RETRO_RENDERDEVICE_GU
+extern int32 gu_faceDepth;   // see GURenderDevice.cpp
+#endif
 int32 gu_s3dVertsXf   = 0;  // vertices put through the transform
 int32 gu_s3dFacesIn   = 0;  // faces reaching the draw phase
 int32 gu_s3dFacesNear = 0;  // faces dropped by the vertZ < 0x100 test
@@ -1155,9 +1164,19 @@ void RSDK::Draw3DScene(uint16 sceneID)
         const int32 s3dMode = (gu_s3dModeCounter++) % 3;
         const SceUInt64 s3dSplitT0 = sceKernelGetSystemTimeWide();
 #endif
+#if S3D_DEPTH_PROBE
+        for (int32 df = 0; df < scn->faceCount; ++df) {
+            const int32 d = scn->faceBuffer[df].depth;
+            if (d < gu_s3dDepthMin) gu_s3dDepthMin = d;
+            if (d > gu_s3dDepthMax) gu_s3dDepthMax = d;
+        }
+#endif
         S3D_TIME_BEGIN(gu_s3dSortUsec);
 #if S3D_SPLIT_DRAW
         if (s3dMode != 2)
+#endif
+#if !GU_S3D_KEEP_SORT
+        if (false)
 #endif
         std::sort(scn->faceBuffer, scn->faceBuffer + scn->faceCount, [](const Scene3DFace &a, const Scene3DFace &b) {
             if (a.depth != b.depth)
@@ -1554,6 +1573,9 @@ void RSDK::Draw3DScene(uint16 sceneID)
 
                     if (v < 0xFF) {
                         drawVert = &scn->vertices[scn->faceBuffer[f].index];
+#if RETRO_RENDERDEVICE_GU
+                        gu_faceDepth = scn->faceBuffer[f].depth;
+#endif
                         DrawBlendedFace(vertPos, vertClrs, *vertCnt, entity->alpha, entity->inkEffect);
                     }
 
