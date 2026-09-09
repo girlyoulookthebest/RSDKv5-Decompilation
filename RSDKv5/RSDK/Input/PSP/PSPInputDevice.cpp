@@ -108,8 +108,19 @@ void RSDK::SKU::InputDevicePSP::ProcessInput(int32 controllerID)
     controller[i].keyRight.press   |= this->hDelta_L > PSP_STICK_DEADZONE;
   }
 
-  stickL[controllerID].hDelta = this->hDelta_L;
-  stickL[controllerID].vDelta = this->vDelta_L;
+  // Centre the magnitudes too, not just the derived directions. A PSP stick
+  // rarely rests at exactly 128 on both axes, so publishing the raw value
+  // leaves a permanent small deflection for anything that reads it.
+  float hOut = this->hDelta_L;
+  float vOut = this->vDelta_L;
+
+  if (hOut > -PSP_STICK_DEADZONE && hOut < PSP_STICK_DEADZONE)
+      hOut = 0.0f;
+  if (vOut > -PSP_STICK_DEADZONE && vOut < PSP_STICK_DEADZONE)
+      vOut = 0.0f;
+
+  stickL[controllerID].hDelta = hOut;
+  stickL[controllerID].vDelta = vOut;
 }
 
 // code below here borrowed liberally from the other backends and
