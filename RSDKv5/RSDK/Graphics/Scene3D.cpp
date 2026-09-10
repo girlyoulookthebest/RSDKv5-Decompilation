@@ -60,6 +60,50 @@ extern int32 gu_profilingEnabled;
 #define S3D_TIME_END(acc) ((void)0)
 #endif
 
+// ---------------------------------------------------------- face culling ---
+// Faces whose projected vertices are collinear cover no pixels, whichever way
+// they face, so Draw3DScene drops them before shading or queueing. In the
+// Special Stage that is 29-44% of all faces.
+//
+// The payoff is not the shading. It is the GE face buffer: without this, busy
+// stretches of the stage overflow it by up to ~130 faces/frame. Culling by
+// winding was tried as well and deleted visible geometry both ways, so only the
+// zero-area test lives here.
+//
+// vertPos is 16.16, but the projection divides before shifting, so positions
+// are whole pixels and this is a pixel-resolution collinearity test. The 64-bit
+// multiply is still needed: the differences reach ~480 << 16.
+int32 gu_s3dFacesDegen = 0; // faces projecting to zero area
+int32 gu_s3dFacesBack  = 0; // faces wound negatively -- counted, never culled
+
+static inline bool S3D_FaceIsCulled(const Vector2 *vertPos, int32 vertCount)
+{
+    if (vertCount < 3)
+        return false;
+
+    const int64 ax = (int64)(vertPos[1].x - vertPos[0].x);
+    const int64 ay = (int64)(vertPos[1].y - vertPos[0].y);
+    const int64 bx = (int64)(vertPos[2].x - vertPos[0].x);
+    const int64 by = (int64)(vertPos[2].y - vertPos[0].y);
+    int64 cross    = ax * by - ay * bx;
+
+    // A quad whose first three vertices are collinear can still have area.
+    if (cross == 0 && vertCount > 3) {
+        const int64 dx = (int64)(vertPos[3].x - vertPos[0].x);
+        const int64 dy = (int64)(vertPos[3].y - vertPos[0].y);
+        cross          = bx * dy - by * dx;
+    }
+
+    if (cross == 0) {
+        ++gu_s3dFacesDegen;
+        return true;
+    }
+
+    if (cross < 0)
+        ++gu_s3dFacesBack;
+    return false;
+}
+
 #if RETRO_REV0U
 #include "Legacy/Scene3DLegacy.cpp"
 #endif
@@ -724,13 +768,8 @@ void RSDK::AddModelToScene(uint16 modelFrames, uint16 sceneIndex, uint8 drawMode
                                     vertex->z = mw23 + (modelVert->x * mw20 >> 8)
                                                 + (mw22 * modelVert->z >> 8) + (mw21 * modelVert->y >> 8);
 
-                                    vertex->nx = (modelVert->nz * mn02 >> 8) + (modelVert->nx * mn00 >> 8)
-                                                 + (mn01 * modelVert->ny >> 8);
                                     vertex->ny = (modelVert->ny * mn11 >> 8) + (modelVert->nz * mn12 >> 8)
                                                  + (modelVert->nx * mn10 >> 8);
-                                    vertex->nz =
-                                        ((modelVert->ny * mn21) >> 8)
-                                        + ((mn20 * modelVert->nx >> 8) + (modelVert->nz * mn22 >> 8));
 
                                     vertex->color = color;
                                 }
@@ -774,13 +813,8 @@ void RSDK::AddModelToScene(uint16 modelFrames, uint16 sceneIndex, uint8 drawMode
                                     vertex->z = mw23 + (modelVert->x * mw20 >> 8)
                                                 + (modelVert->y * mw21 >> 8) + (mw22 * modelVert->z >> 8);
 
-                                    vertex->nx = (mn00 * modelVert->nx >> 8) + (modelVert->ny * mn01 >> 8)
-                                                 + (mn02 * modelVert->nz >> 8);
                                     vertex->ny = (mn10 * modelVert->nx >> 8) + (modelVert->ny * mn11 >> 8)
                                                  + (mn12 * modelVert->nz >> 8);
-                                    vertex->nz =
-                                        ((mn22 * modelVert->nz) >> 8)
-                                        + ((modelVert->ny * mn21 >> 8) + (mn20 * modelVert->nx >> 8));
 
                                     vertex->color = modelColor->color;
                                 }
@@ -957,12 +991,8 @@ void RSDK::AddMeshFrameToScene(uint16 modelFrames, uint16 sceneIndex, Animator *
                                                 + (z * mw12 >> 8);
                                     vertex->z = mw23 + (x * mw20 >> 8) + (mw22 * z >> 8)
                                                 + (mw21 * y >> 8);
-                                    vertex->nx = (nz * mn02 >> 8) + (nx * mn00 >> 8)
-                                                 + (mn01 * ny >> 8);
                                     vertex->ny = (ny * mn11 >> 8) + (nz * mn12 >> 8)
                                                  + (nx * mn10 >> 8);
-                                    vertex->nz = ((ny * mn21) >> 8)
-                                                 + ((mn20 * nx >> 8) + (nz * mn22 >> 8));
                                     vertex->color = color;
                                 }
                             }
@@ -1014,12 +1044,8 @@ void RSDK::AddMeshFrameToScene(uint16 modelFrames, uint16 sceneIndex, Animator *
                                                 + (mw10 * x >> 8);
                                     vertex->z = mw23 + (x * mw20 >> 8) + (y * mw21 >> 8)
                                                 + (mw22 * z >> 8);
-                                    vertex->nx = (mn00 * nx >> 8) + (ny * mn01 >> 8)
-                                                 + (mn02 * nz >> 8);
                                     vertex->ny = (mn10 * nx >> 8) + (ny * mn11 >> 8)
                                                  + (mn12 * nz >> 8);
-                                    vertex->nz = ((mn22 * nz) >> 8)
-                                                 + ((ny * mn21 >> 8) + (mn20 * nx >> 8));
                                     vertex->color = modelColor->color;
                                 }
                             }
@@ -1508,39 +1534,49 @@ void RSDK::Draw3DScene(uint16 sceneID)
                     int32 vertCount         = *vertCnt;
                     ++gu_s3dFacesIn;
 
+                    // Project first, shade second. A third of the Special
+                    // Stage's faces project to zero area and are dropped by
+                    // S3D_FaceIsCulled, so shading waits until a face is known
+                    // to survive. The test needs screen-space positions, so the
+                    // projection has to come first either way.
                     int32 v = 0;
                     for (; v < vertCount && v < 0xFF; ++v) {
                         int32 vertZ = drawVert[v].z;
                         if (vertZ < 0x100) {
                             v = 0xFF;
+                            ++gu_s3dFacesNear;
                         }
                         else {
                             vertPos[v].x = (s3dCenterX << 16) + ((drawVert[v].x << s3dProjX) / vertZ << 16);
                             vertPos[v].y = (s3dCenterY << 16) - ((drawVert[v].y << s3dProjY) / vertZ << 16);
+                        }
+                    }
 
+                    if (v < 0xFF && !S3D_FaceIsCulled(vertPos, vertCount)) {
+                        for (int32 sv = 0; sv < vertCount && sv < 0xFF; ++sv) {
 #if S3D_SPLIT_DRAW
                             if (s3dMode == 1) {
-                                vertClrs[v] = drawVert[v].color;
+                                vertClrs[sv] = drawVert[sv].color;
                                 continue;
                             }
 #endif
-                            int32 normal    = drawVert[v].ny;
+                            int32 normal    = drawVert[sv].ny;
                             int32 normalVal = (normal >> 2) * (abs(normal) >> 2);
 
                             int32 specular = normalVal >> 6 >> s3dSpecIX;
                             specular       = CLAMP(specular, 0x00, 0xFF);
                             int32 r =
-                                specular + ((int32)((drawVert[v].color >> 16) & 0xFF) * ((normal >> 10) + s3dDiffX) >> s3dDiffIX);
+                                specular + ((int32)((drawVert[sv].color >> 16) & 0xFF) * ((normal >> 10) + s3dDiffX) >> s3dDiffIX);
 
                             specular = normalVal >> 6 >> s3dSpecIY;
                             specular = CLAMP(specular, 0x00, 0xFF);
                             int32 g =
-                                specular + ((int32)((drawVert[v].color >> 8) & 0xFF) * ((normal >> 10) + s3dDiffY) >> s3dDiffIY);
+                                specular + ((int32)((drawVert[sv].color >> 8) & 0xFF) * ((normal >> 10) + s3dDiffY) >> s3dDiffIY);
 
                             specular = normalVal >> 6 >> s3dSpecIZ;
                             specular = CLAMP(specular, 0x00, 0xFF);
                             int32 b =
-                                specular + ((int32)((drawVert[v].color >> 0) & 0xFF) * ((normal >> 10) + s3dDiffZ) >> s3dDiffIZ);
+                                specular + ((int32)((drawVert[sv].color >> 0) & 0xFF) * ((normal >> 10) + s3dDiffZ) >> s3dDiffIZ);
 
                             r = CLAMP(r, 0x00, 0xFF);
                             g = CLAMP(g, 0x00, 0xFF);
@@ -1558,7 +1594,7 @@ void RSDK::Draw3DScene(uint16 sceneID)
                                     FILE *df = fopen("model_dbg.log", "a");
                                     if (df) {
                                         fprintf(df, "SHADE in=%06X ny=%d normalVal=%d specTerm=%d -> out=%02X%02X%02X\n",
-                                                (unsigned int)(drawVert[v].color & 0xFFFFFF), (int)normal, (int)normalVal,
+                                                (unsigned int)(drawVert[sv].color & 0xFFFFFF), (int)normal, (int)normalVal,
                                                 (int)CLAMP(normalVal >> 6 >> s3dSpecIX, 0x00, 0xFF), (unsigned int)r, (unsigned int)g,
                                                 (unsigned int)b);
                                         fclose(df);
@@ -1567,11 +1603,9 @@ void RSDK::Draw3DScene(uint16 sceneID)
                             }
 #endif
 
-                            vertClrs[v] = (r << 16) | (g << 8) | (b << 0);
+                            vertClrs[sv] = (r << 16) | (g << 8) | (b << 0);
                         }
-                    }
 
-                    if (v < 0xFF) {
                         drawVert = &scn->vertices[scn->faceBuffer[f].index];
 #if RETRO_RENDERDEVICE_GU
                         gu_faceDepth = scn->faceBuffer[f].depth;

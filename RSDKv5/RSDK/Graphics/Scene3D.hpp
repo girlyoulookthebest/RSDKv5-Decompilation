@@ -81,9 +81,16 @@ struct Scene3DVertex {
     int32 y;
     int32 z;
 
-    int32 nx;
+    // Only ny survives. Draw3DScene shades from the y component of the
+    // transformed normal, and nothing in the engine or the game reads nx or nz
+    // -- they were computed and stored every frame for nobody.
+    //
+    // That matters more than the arithmetic saved. The Special Stage's
+    // transform measures 853 ns/vertex against 308 ns/vertex for the identical
+    // arithmetic on cached data, so it is waiting on memory, not computing;
+    // dropping these takes the struct from 28 bytes to 20, and the per-frame
+    // vertex working set from ~523 KB to ~374 KB against a 16 KB data cache.
     int32 ny;
-    int32 nz;
 
     // No tx/ty: nothing in the engine or the game ever read them. Removing
     // them takes this struct from 36 to 28 bytes. Texture coordinates for a

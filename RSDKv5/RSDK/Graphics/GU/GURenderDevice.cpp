@@ -3691,10 +3691,20 @@ static void GU_UpdateFPSCounter()
                                     (int)gu_s3dDepthMin, (int)gu_s3dDepthMax);
                         }
                         extern int32 gu_s3dVertsXf, gu_s3dFacesIn, gu_s3dFacesNear;
+                        extern int32 gu_s3dFacesDegen, gu_s3dFacesBack;
                         fprintf(h, "     geometry/frame: verts transformed %.0f  faces %.0f  of which dropped near-plane %.0f\n",
                                 (double)gu_s3dVertsXf / frameCount, (double)gu_s3dFacesIn / frameCount,
                                 (double)gu_s3dFacesNear / frameCount);
+                        // Zero-area faces are culled. Back-wound faces are only
+                        // counted: culling either winding deleted visible
+                        // geometry in the Special Stage.
+                        fprintf(h, "     face cull/frame: zero-area %.0f (%.1f%%)  back-wound %.0f (%.1f%%)\n",
+                                (double)gu_s3dFacesDegen / frameCount,
+                                gu_s3dFacesIn ? 100.0 * gu_s3dFacesDegen / gu_s3dFacesIn : 0.0,
+                                (double)gu_s3dFacesBack / frameCount,
+                                gu_s3dFacesIn ? 100.0 * gu_s3dFacesBack / gu_s3dFacesIn : 0.0);
                         gu_s3dVertsXf = gu_s3dFacesIn = gu_s3dFacesNear = 0;
+                        gu_s3dFacesDegen = gu_s3dFacesBack = 0;
                     }
                     extern SceUInt64 gu_s3dMeshUsec, gu_s3dSortUsec, gu_s3dDrawUsec;
                     fprintf(h, "     scene3d: mesh(transform) %6.2f  sort %6.2f  draw %6.2f\n", (double)gu_s3dMeshUsec / 1000.0 / frameCount,
