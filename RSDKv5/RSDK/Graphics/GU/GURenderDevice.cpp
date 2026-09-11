@@ -434,7 +434,13 @@ enum GUQueueEntryType {
     GU_ENTRY_FACEBATCH,
     GU_ENTRY_TILEBATCH,
     GU_ENTRY_CIRCLE,
-    GU_ENTRY_CIRCLEOUTLINE
+    GU_ENTRY_CIRCLEOUTLINE,
+    GU_ENTRY_LINE,
+
+    // Must stay last. The per-type profiling arrays are sized by this; they
+    // used to be sized by a hand-written 9 while the enum had 11 entries, so
+    // every circle and circle outline wrote past the end of them.
+    GU_ENTRY_TYPE_COUNT
 };
 
 #define MAX_FACE_VERTS 8
@@ -522,6 +528,14 @@ struct GURectEntry {
     int32 x, y, width, height;
     uint32 color;
     int32 alpha, inkEffect;
+};
+
+struct GULineEntry {
+    ScreenInfo *screen; // see GUSpriteEntry::screen
+    int32 x1, y1, x2, y2;
+    uint32 color;
+    int32 alpha, inkEffect;
+    bool32 screenRelative;
 };
 
 // DrawSpriteRotozoom (scaled/rotated sprites -- water shimmer, spinning
@@ -855,6 +869,7 @@ struct GUQueueEntry {
         GUTileBatchEntry tileBatch;
         GUCircleEntry circle;
         GUCircleOutlineEntry circleOutline;
+        GULineEntry line;
     };
 };
 
@@ -878,7 +893,6 @@ static int32 gu_queueDrains = 0;
 
 // Per-draw-type time/count accounting, indexed by GUQueueEntryType and
 // accumulated across the reporting window. See the flush loop.
-#define GU_ENTRY_TYPE_COUNT 9
 static SceUInt64 gu_profUsec[GU_ENTRY_TYPE_COUNT];
 static uint32 gu_profCount[GU_ENTRY_TYPE_COUNT];
 
@@ -1598,6 +1612,33 @@ void GU_QueueRectDraw(int32 x, int32 y, int32 width, int32 height, uint32 color,
     e->rect.inkEffect  = inkEffect;
 }
 
+// Lines used to drain the whole queue and draw immediately. Each drain costs
+// ~0.15ms of fixed overhead (cache writeback, GE sync) however little is queued,
+// and a Special Stage item box draws its wireframe as ~96 lines: measured at
+// 96-120 drains and 14-16ms per frame whenever one was on screen. Queued, a line
+// costs a slot and replays in order like everything else.
+void GU_QueueLineDraw(int32 x1, int32 y1, int32 x2, int32 y2, uint32 color, int32 alpha, int32 inkEffect, bool32 screenRelative)
+{
+#if GU_BYPASS_DRAW_QUEUE
+    DrawLine_CPU(x1, y1, x2, y2, color, alpha, inkEffect, screenRelative);
+    return;
+#endif
+
+    GU_DrainQueueIfFull();
+
+    GUQueueEntry *e          = &gu_draw_queue[gu_draw_queue_count++];
+    e->type                  = GU_ENTRY_LINE;
+    e->line.screen           = currentScreen;
+    e->line.x1               = x1;
+    e->line.y1               = y1;
+    e->line.x2               = x2;
+    e->line.y2               = y2;
+    e->line.color            = color;
+    e->line.alpha            = alpha;
+    e->line.inkEffect        = inkEffect;
+    e->line.screenRelative   = screenRelative;
+}
+
 // Queues a rotozoom (scaled/rotated) sprite draw. If the queue is full,
 // applies it immediately rather than dropping it -- same fallback
 // philosophy as the rest of this file.
@@ -1949,6 +1990,12 @@ void GU_FlushDrawQueue()
                 if (!e->rect.screen) break;
                 currentScreen = e->rect.screen;
                 DrawRectangle_CPU(e->rect.x, e->rect.y, e->rect.width, e->rect.height, e->rect.color, e->rect.alpha, e->rect.inkEffect);
+                break;
+            case GU_ENTRY_LINE:
+                if (!e->line.screen) break;
+                currentScreen = e->line.screen;
+                DrawLine_CPU(e->line.x1, e->line.y1, e->line.x2, e->line.y2, e->line.color, e->line.alpha, e->line.inkEffect,
+                             e->line.screenRelative);
                 break;
             case GU_ENTRY_ROTOZOOM: {
                 GURotoEntry *r = &e->roto;
@@ -3575,8 +3622,9 @@ static void GU_UpdateFPSCounter()
             fprintf(f, "cpu %d MHz, bus %d MHz\n", scePowerGetCpuClockFrequencyInt(), scePowerGetBusClockFrequencyInt());
             fprintf(f, "queue %s, gpu sprites %s\n", GU_BYPASS_DRAW_QUEUE ? "BYPASSED" : "on", GU_AB_FORCE_CPU_ONLY ? "off" : "ON");
 
-            static const char *typeNames[GU_ENTRY_TYPE_COUNT] = { "sprite", "layer",  "fillscreen", "rect",         "rotozoom",
-                                                                  "face",   "bfaced", "circle",     "circleoutline" };
+            static const char *typeNames[GU_ENTRY_TYPE_COUNT] = { "sprite",    "layer",     "fillscreen", "rect",
+                                                                  "rotozoom",  "face",      "bfaced",     "facebatch",
+                                                                  "tilebatch", "circle",    "circleoutline", "line" };
             fprintf(f, "\nper-frame cost by draw type:\n");
             for (int32 t = 0; t < GU_ENTRY_TYPE_COUNT; ++t) {
                 if (!gu_profCount[t])

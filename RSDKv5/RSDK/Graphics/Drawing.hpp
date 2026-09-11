@@ -394,6 +394,11 @@ void DrawRectangle(int32 x, int32 y, int32 width, int32 height, uint32 color, in
 // GU/GURenderDevice.cpp.
 void DrawRectangle_CPU(int32 x, int32 y, int32 width, int32 height, uint32 color, int32 alpha, int32 inkEffect);
 #endif
+
+#if RETRO_RENDERDEVICE_GU
+// PSP only: DrawLine's rasterizer, replayed from the draw queue. See GU_QueueLineDraw.
+void DrawLine_CPU(int32 x1, int32 y1, int32 x2, int32 y2, uint32 color, int32 alpha, int32 inkEffect, bool32 screenRelative);
+#endif
 void DrawCircle(int32 x, int32 y, int32 radius, uint32 color, int32 alpha, int32 inkEffect, bool32 screenRelative);
 #if RETRO_RENDERDEVICE_GU
 // PSP only: see DrawFace_CPU -- same split reasoning (circular iris-wipe

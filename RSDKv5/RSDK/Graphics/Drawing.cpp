@@ -659,9 +659,14 @@ void RSDK::FillScreen_CPU(uint32 color, int32 alphaR, int32 alphaG, int32 alphaB
 void RSDK::DrawLine(int32 x1, int32 y1, int32 x2, int32 y2, uint32 color, int32 alpha, int32 inkEffect, bool32 screenRelative)
 {
 #if RETRO_RENDERDEVICE_GU
-    // Direct framebuffer write, not queued -- drain first so it lands in call
-    // order rather than underneath everything already queued.
-    GU_FlushDrawQueue();
+    // Queued like every other draw -- see GU_QueueLineDraw for why it no longer
+    // drains the queue first.
+    GU_QueueLineDraw(x1, y1, x2, y2, color, alpha, inkEffect, screenRelative);
+}
+
+// The actual CPU rasterizer, replayed from the draw queue.
+void RSDK::DrawLine_CPU(int32 x1, int32 y1, int32 x2, int32 y2, uint32 color, int32 alpha, int32 inkEffect, bool32 screenRelative)
+{
 #endif
 
     color = ((color&0xFF)<<16)|(color&0xFF00)|((color&0xFF0000)>>16);
