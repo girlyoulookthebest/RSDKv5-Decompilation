@@ -1539,6 +1539,20 @@ void RSDK::Draw3DScene(uint16 sceneID)
                     // S3D_FaceIsCulled, so shading waits until a face is known
                     // to survive. The test needs screen-space positions, so the
                     // projection has to come first either way.
+                    //
+                    // The two divides below share one divisor, which looks like
+                    // an obvious reciprocal-multiply saving. It is not, measured
+                    // both ways: psp-gcc -O2 emits 35 instructions and 2 divides
+                    // for this loop, 56 for one divide plus a reciprocal, and 94
+                    // for a reciprocal corrected to match integer division. Over
+                    // 871k cases (z >= 0x100, num across int32) the uncorrected
+                    // reciprocal differs from / on 50% of them, always by one --
+                    // and these coordinates are whole pixels, so that is a full
+                    // pixel of shift on half the geometry. The corrected form
+                    // costs more than the ~36-cycle divide it removes. The way
+                    // to get rid of these divides is to let the GE do the
+                    // perspective divide (see the stashed GPU floor work), not
+                    // to rewrite them here.
                     int32 v = 0;
                     for (; v < vertCount && v < 0xFF; ++v) {
                         int32 vertZ = drawVert[v].z;
