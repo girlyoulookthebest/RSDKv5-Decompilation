@@ -1,5 +1,6 @@
 using namespace RSDK;
 #include <pspctrl.h>
+#include <psppower.h>
 
 InputState mappings[12];
 
@@ -24,6 +25,12 @@ int32 last_buttons = 0;
 // wears, and a false direction in a menu is far more noticeable than a slightly
 // larger dead area in gameplay.
 #define PSP_STICK_DEADZONE 0.3f
+
+// A stick direction engages past ENGAGE and releases only below RELEASE. With a
+// single threshold, a stick resting near it crosses it again and again, and
+// each crossing is a fresh press to a menu -- the cursor moved on its own.
+#define PSP_STICK_ENGAGE  0.5f
+#define PSP_STICK_RELEASE 0.3f
 #define PSP_STICK_LOG 0
 
 void RSDK::SKU::InputDevicePSP::UpdateInput()
@@ -46,6 +53,14 @@ void RSDK::SKU::InputDevicePSP::UpdateInput()
   // Scaled by 128 so a fully deflected stick reaches 1.0.
   this->hDelta_L = ((float)ctrl_data.Lx - 128.0f) / 128.0f;
   this->vDelta_L = -((float)ctrl_data.Ly - 128.0f) / 128.0f;
+
+  // Playing with only the stick dimmed the screen on hardware until a button
+  // was pressed: the firmware's idle timer is reset by buttons, evidently not
+  // by the stick. Tick it while the stick is held, which is the reset a button
+  // press gives -- and nothing while the pad is untouched, so sleep still works.
+  if (this->hDelta_L > PSP_STICK_DEADZONE || this->hDelta_L < -PSP_STICK_DEADZONE || this->vDelta_L > PSP_STICK_DEADZONE
+      || this->vDelta_L < -PSP_STICK_DEADZONE)
+    scePowerTick(PSP_POWER_TICK_ALL);
 
 #if PSP_STICK_LOG
   {
@@ -83,6 +98,12 @@ void RSDK::SKU::InputDevicePSP::UpdateInput()
 // one frame after being pressed -- held input like walking never sustained.
 void RSDK::SKU::InputDevicePSP::ProcessInput(int32 controllerID)
 {
+  static bool stickUp = false, stickDown = false, stickLeft = false, stickRight = false;
+  stickUp    = this->vDelta_L > (stickUp ? PSP_STICK_RELEASE : PSP_STICK_ENGAGE);
+  stickDown  = this->vDelta_L < -(stickDown ? PSP_STICK_RELEASE : PSP_STICK_ENGAGE);
+  stickLeft  = this->hDelta_L < -(stickLeft ? PSP_STICK_RELEASE : PSP_STICK_ENGAGE);
+  stickRight = this->hDelta_L > (stickRight ? PSP_STICK_RELEASE : PSP_STICK_ENGAGE);
+
   for (int i = 0; i < PLAYER_COUNT; i++) {
     if (i == 2)
       continue;
@@ -100,12 +121,13 @@ void RSDK::SKU::InputDevicePSP::ProcessInput(int32 controllerID)
     controller[i].keyStart.press    |= mappings[10].down;
     controller[i].keySelect.press   |= mappings[11].down;
 
-    // Fold the stick into the d-pad as well. Gameplay reads the digital
-    // direction keys, so publishing stickL alone would only work in menus.
-    controller[i].keyUp.press      |= this->vDelta_L > PSP_STICK_DEADZONE;
-    controller[i].keyDown.press    |= this->vDelta_L < -PSP_STICK_DEADZONE;
-    controller[i].keyLeft.press    |= this->hDelta_L < -PSP_STICK_DEADZONE;
-    controller[i].keyRight.press   |= this->hDelta_L > PSP_STICK_DEADZONE;
+    // The stick drives its own direction keys, as the engine's other backends
+    // do, rather than the d-pad. Player.c and UFO_Player.c read stick->keyUp
+    // alongside the d-pad, so gameplay is unaffected.
+    stickL[i].keyUp.press    |= stickUp;
+    stickL[i].keyDown.press  |= stickDown;
+    stickL[i].keyLeft.press  |= stickLeft;
+    stickL[i].keyRight.press |= stickRight;
   }
 
   // Centre the magnitudes too, not just the derived directions. A PSP stick
