@@ -1955,8 +1955,11 @@ void GU_FlushDrawQueue()
         // depends on knowing WHICH draws actually cost the frame, and
         // measured frame time (~56ms) is far above what earlier (since
         // deleted) profiling implied -- so measure it rather than assume.
-        const SceUInt64 gu_entryStart = sceKernelGetSystemTimeWide();
-        gu_profCount[e->type]++;
+        // Two timer syscalls per queued draw come to hundreds a frame, so this
+        // accounting only runs while profiling. It used to run in every build.
+        const SceUInt64 gu_entryStart = gu_profilingEnabled ? sceKernelGetSystemTimeWide() : 0;
+        if (gu_profilingEnabled)
+            gu_profCount[e->type]++;
 
         switch (e->type) {
             case GU_ENTRY_SPRITE: {
@@ -2058,7 +2061,8 @@ void GU_FlushDrawQueue()
             default: break;
         }
 
-        gu_profUsec[e->type] += sceKernelGetSystemTimeWide() - gu_entryStart;
+        if (gu_profilingEnabled)
+            gu_profUsec[e->type] += sceKernelGetSystemTimeWide() - gu_entryStart;
     }
 
     // Catches a GPU batch left open because the frame's last queued entry
