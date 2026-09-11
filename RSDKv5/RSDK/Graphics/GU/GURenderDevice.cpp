@@ -646,7 +646,11 @@ struct GUFaceVertex {
 #define GU_ATLAS_TILES_ROW (GU_ATLAS_DIM / TILE_SIZE) // 32
 // Above this a layer is genuinely warped rather than scrolled, and the
 // per-band batches would cost more than the CPU rasterizer.
-#define GU_TILE_MAX_BANDS  8
+// 8 refused the Special Stage's rippling background (4.95ms/frame on the CPU):
+// its scroll changes every few lines, so it needs many thin bands. 32 thin
+// bands still fit the 4096-vertex tile buffer (~120 verts each worst case),
+// and a layer that doesn't fit falls back to the CPU via the "room" check.
+#define GU_TILE_MAX_BANDS  32
 // Diagnostic: hold L to route layers back to the CPU rasterizer for a live A/B.
 #define GU_TILE_PAD_TOGGLE 0
 static u8 *gu_tile_atlas       = NULL;
@@ -703,6 +707,7 @@ static void GU_BuildTileAtlas();
 // refusal is silent otherwise, which makes "nothing went to the GE" and
 // "everything went to the GE and drew nothing" look identical from outside.
 static int32 gu_tile_decline[9] = { 0 };
+static int32 gu_tileBandsWantedMax = 0; // most bands any HSCROLL layer needed this window (profiling only)
 static int32 gu_faceRejectRange = 0;  // projected outside the GE's usable range
 static int32 gu_faceRejectFull  = 0;  // vertex buffer exhausted this frame
 static int32 gu_faceRejectInk   = 0;  // ink effect or vert count the GE path cannot express
@@ -1389,6 +1394,17 @@ static bool GU_TryQueueLayerGPU(TileLayer *layer)
         bandCount    = 1;
     }
     else {
+        // Counted separately so a refusal still reports how many bands the
+        // layer needed, rather than just that it needed more than the cap.
+        if (gu_profilingEnabled) {
+            int32 runs = 1;
+            for (int32 cy = clipY1 + 1; cy < clipY2; ++cy)
+                if (FROM_FIXED(scanlines[cy].position.x) != FROM_FIXED(scanlines[cy - 1].position.x))
+                    ++runs;
+            if (runs > gu_tileBandsWantedMax)
+                gu_tileBandsWantedMax = runs;
+        }
+
         int32 cur = FROM_FIXED(scanlines[clipY1].position.x);
         int32 st  = clipY1;
         for (int32 cy = clipY1 + 1; cy < clipY2; ++cy) {
@@ -3686,11 +3702,13 @@ static void GU_UpdateFPSCounter()
                 fprintf(h, "     gpu tiles: %6.1f quads %4.1f batches  dma %5.2f  ge %5.2f  (per frame)\n",
                         (double)gu_tileQuadCount / frameCount, (double)gu_tileBatchCount / frameCount,
                         (double)gu_tileDmaUsec / 1000.0 / frameCount, (double)gu_tileGeUsec / 1000.0 / frameCount);
-                fprintf(h, "     tile declines: type %d atlas %d verts %d stale %d size %d clip %d xspan %d pal %d room %d\n",
+                fprintf(h, "     tile declines: type %d atlas %d verts %d stale %d size %d clip %d xspan %d pal %d room %d  | most bands wanted %d (cap %d)\n",
                         (int)gu_tile_decline[0], (int)gu_tile_decline[1], (int)gu_tile_decline[2],
                         (int)gu_tile_decline[3], (int)gu_tile_decline[4], (int)gu_tile_decline[5],
-                        (int)gu_tile_decline[6], (int)gu_tile_decline[7], (int)gu_tile_decline[8]);
+                        (int)gu_tile_decline[6], (int)gu_tile_decline[7], (int)gu_tile_decline[8],
+                        (int)gu_tileBandsWantedMax, (int)GU_TILE_MAX_BANDS);
                 for (int32 di = 0; di < 9; ++di) gu_tile_decline[di] = 0;
+                gu_tileBandsWantedMax = 0;
                 gu_tileDmaUsec = gu_tileGeUsec = 0;
                 gu_tileBatchCount = gu_tileQuadCount = 0;
 #endif
