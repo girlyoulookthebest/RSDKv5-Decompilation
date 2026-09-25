@@ -283,6 +283,15 @@ void RSDK::ProcessInput()
                 else
                     lStick[i]->down = false;
 
+#if RETRO_PLATFORM == RETRO_PSP
+                // Shaking a PSP can swing the stick fully down for up to half a
+                // second, which no filter tells apart from a push. Menus read
+                // .press and gameplay reads .down, so the stick's directions
+                // never press: menus take the d-pad, gameplay keeps the stick.
+                if (i < 4)
+                    lStick[i]->press = false;
+#endif
+
                 if (rStick[i]) {
                     if (rStick[i]->press) {
                         if (rStick[i]->down)
