@@ -345,6 +345,7 @@ void RSDK::InitObjects()
 #if RETRO_RENDERDEVICE_GU
 // Splits the frame's non-rendering time into entity updates vs. draw-list traversal
 #include <psputils.h>
+#include <algorithm>
 SceUInt64 gu_objUpdateUsecAccum   = 0;
 SceUInt64 gu_objDrawListUsecAccum = 0;
 SceUInt64 gu_dlSortUsec = 0;    // draw-list depth sort
@@ -802,28 +803,33 @@ void RSDK::ProcessObjectDrawLists()
                         // sorted group, which was ~85ms/frame of the 114ms spent
                         // in this function.
                         //
-                        // Insertion sort is O(n) on nearly-sorted input, which is
-                        // what a draw list is frame to frame: entities keep their
-                        // relative depth order and only a few move. Same output as
-                        // the bubble sort -- descending zdepth, and stable, since
-                        // it stops on equal rather than swapping, so entities at
-                        // the same depth keep their original order. That matters:
+                        // Now a stable sort of compact (zdepth, slot) keys, so the
+                        // comparisons no longer chase objectEntityList. Same output
+                        // as the bubble sort: descending zdepth, and stable, because
                         // reordering coplanar entities frame to frame flickers.
-                        for (int32 i = 1; i < list->entityCount; ++i) {
-                            const int32 slot  = list->entries[i];
-                            const int32 zdepth = objectEntityList[slot].zdepth;
-
-                            int32 j = i - 1;
-                            while (j >= 0 && objectEntityList[list->entries[j]].zdepth < zdepth) {
-                                list->entries[j + 1] = list->entries[j];
-                                --j;
+                        {
+                            struct DrawKey {
+                                int32 zdepth;
+                                int32 slot;
+                            };
+                            static DrawKey keys[ENTITY_COUNT];
+                            const int32 n = list->entityCount;
+                            for (int32 i = 0; i < n; ++i) {
+                                keys[i].slot   = list->entries[i];
+                                keys[i].zdepth = objectEntityList[keys[i].slot].zdepth;
                             }
-                            list->entries[j + 1] = slot;
+                            std::stable_sort(keys, keys + n, [](const DrawKey &a, const DrawKey &b) { return a.zdepth > b.zdepth; });
+                            for (int32 i = 0; i < n; ++i)
+                                list->entries[i] = keys[i].slot;
                         }
                     }
 
                     const SceUInt64 dlT1 = sceKernelGetSystemTimeWide();
                     gu_dlSortUsec += dlT1 - dlT0;
+
+#if RETRO_RENDERDEVICE_GU
+                    GU_LayersQueued(); // let the GE start on what is queued so far
+#endif
 
                     for (int32 i = 0; i < list->entityCount; ++i) {
                         ++gu_dlDrawCalls;
@@ -833,6 +839,12 @@ void RSDK::ProcessObjectDrawLists()
                         if (sceneInfo.entity->visible) {
                             if (objectClassList[stageObjectIDs[sceneInfo.entity->classID]].draw)
                                 objectClassList[stageObjectIDs[sceneInfo.entity->classID]].draw();
+#if RETRO_RENDERDEVICE_GU
+                            // And every 16 entities, or what the last group draws only
+                            // reaches the GE at the flush, where the CPU waits for it.
+                            if ((i & 15) == 15)
+                                GU_LayersQueued();
+#endif
 
 #if RETRO_VER_EGS || RETRO_USE_DUMMY_ACHIEVEMENTS
                             if (i == list->entityCount - 1)

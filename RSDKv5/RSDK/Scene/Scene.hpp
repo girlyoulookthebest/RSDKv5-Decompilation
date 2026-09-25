@@ -334,6 +334,8 @@ void DrawLayerBasic(TileLayer *layer);
 #if RETRO_RENDERDEVICE_GU
 // PSP only: queues this layer's draw for the unified per-frame GU draw queue (see GU/GURenderDevice.cpp) instead of drawing it immediately.
 void GU_QueueLayerDraw(TileLayer *layer);
+// PSP only: lets the GE start drawing what has been queued so far (GU/GUGeAsync.hpp).
+void GU_LayersQueued();
 // PSP only: the GE samples tiles from a repacked atlas, so it has to be told
 // when the engine rewrites tile pixels. Scanning the tileset to find out cost
 // ~2.5ms/frame (it streams all 256KB through cache); the engine already knows.

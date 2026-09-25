@@ -184,10 +184,10 @@ static int32 present_buffer_index = 0;
 // terminators landed outside the buffer, so the GE ran off the end of the list
 // and executed adjacent memory as commands -- colour noise, then the console
 // powering off. Layer banding is what first produced runs that long.
-#define GE_TRI_CMD_WORDS 1024
+#define GE_TRI_CMD_WORDS 2048 // one list now holds a whole run of batches (GUGeAsync.hpp)
 #define GE_TRI_RUN_HEADER 9
 #define GE_TRI_RUN_FOOTER 8
-#define GE_TRI_PER_BATCH  21
+#define GE_TRI_PER_BATCH  25 // + the sheet rebind a sprite batch adds (GUSpriteGE.hpp)
 // Longest run that certainly fits, with a word of slack.
 #define GU_TILE_RUN_MAX ((GE_TRI_CMD_WORDS - GE_TRI_RUN_HEADER - GE_TRI_RUN_FOOTER - 1) / GE_TRI_PER_BATCH)
 
@@ -436,6 +436,7 @@ enum GUQueueEntryType {
     GU_ENTRY_CIRCLE,
     GU_ENTRY_CIRCLEOUTLINE,
     GU_ENTRY_LINE,
+    GU_ENTRY_IDXBATCH, // indexed 3D faces over the fast path's records (S3DFast.hpp)
 
     // Must stay last. The per-type profiling arrays are sized by this; they
     // used to be sized by a hand-written 9 while the enum had 11 entries, so
@@ -655,6 +656,9 @@ struct GUFaceVertex {
 #define GU_TILE_PAD_TOGGLE 0
 static u8 *gu_tile_atlas       = NULL;
 static int32 gu_tile_atlas_ok  = 0;
+// One CLUT per palette bank -- see GU_EmitTileTextureState.
+static uint16 __attribute__((aligned(16))) gu_clut_banks[PALETTE_BANK_COUNT][256];
+static uint32 gu_clut_built = 0;
 static int32 gu_atlas_scene    = -1; // listPos the atlas was built for
 static uint8 gu_tile_dirty[TILE_COUNT];  // tiles the engine has rewritten
 static bool gu_atlas_all_dirty = true;
@@ -776,6 +780,9 @@ static int32 gu_tileBatchCount = 0, gu_tileQuadCount = 0;
 
 struct GUTileBatchEntry {
     int32 firstVert, vertCount, bank;
+    uint8 roto;      // 0 tile quads, 1 rotozoom lines (GURoto.hpp), 2 scaled sprites (GUSpriteGE.hpp)
+    uint8 submitted; // already sent to the GE by GU_GeTryEager
+    uint16 sheet;    // roto == 2: the sprite sheet sampled
     // Snapshot, not a pointer: clipBound_* are rewritten on the live
     // ScreenInfo as the frame draws, so by flush time they no longer
     // describe the region this layer was clipped to. Reading them late
@@ -816,8 +823,16 @@ static GUFaceVertex *gu_face_verts = NULL;
 static int32 gu_face_vert_max      = 0;
 static int32 gu_face_vert_count = 0;
 
+// Vertex records and indices for the Scene3D fast path's indexed batches
+// (S3DFast.hpp). Both are reset at the end of each flush.
+static GUFaceVertex *gu_rec_pool = NULL;
+static int32 gu_rec_count  = 0;
+static int32 gu_rec_max    = 0;
+static uint16 *gu_idx_pool = NULL;
+static int32 gu_idx_count  = 0;
+static int32 gu_idx_max    = 0;
+
 // Per-window profiling for the GPU face path.
-static SceUInt64 gu_faceDmaUsec = 0, gu_faceGeUsec = 0;
 static int32 gu_faceBatchCount = 0, gu_faceTriCount = 0;
 
 // Tile-layer profiling: cost per layer type, and scanline-band counts.
@@ -834,6 +849,17 @@ static int32 gu_layerBands = 0, gu_layerBandSamples = 0;
 struct GUFaceBatchEntry {
     ScreenInfo screenSnapshot;
     int32 firstVert, vertCount;
+    uint8 blend;     // 1 = INK_BLEND (GUFaceGE.hpp); blending is per batch
+    uint8 submitted; // already sent to the GE by GU_GeTryEager
+};
+
+// Indexed faces from the Scene3D fast path (S3DFast.hpp).
+struct GUIdxBatchEntry {
+    ScreenInfo screenSnapshot;
+    const void *verts;     // S3DDrawVertex records in gu_rec_pool
+    const uint16 *indices; // block in gu_idx_pool
+    int32 vertCount, indexCount;
+    uint8 submitted;
 };
 
 // DrawCircle/DrawCircleOutline -- same clip-bound-drift vulnerability as
@@ -871,6 +897,7 @@ struct GUQueueEntry {
         GUFaceEntry face;
         GUBlendedFaceEntry blendedFace;
         GUFaceBatchEntry faceBatch;
+        GUIdxBatchEntry idxBatch;
         GUTileBatchEntry tileBatch;
         GUCircleEntry circle;
         GUCircleOutlineEntry circleOutline;
@@ -1178,12 +1205,14 @@ static void GU_SyncSpriteBatchIfActive()
 
 void GU_FlushDrawQueue();
 #if GU_GPU_FACES
-static void GU_DrawFaceBatch(int32 firstVert, int32 vertCount);
+static void GU_DrawFaceBatch(const GUFaceVertex *verts, int32 vertCount, int32 blend, const uint16 *indices, int32 indexCount);
 #endif
 #if GU_GPU_TILES || GU_TILE_SELFTEST || GU_TILE_ATLAS_TEST
 static void GU_DrawTileBatch(int32 firstVert, int32 vertCount, int32 bank);
 static void GU_DrawTileBatchRun(int32 firstEntry, int32 entryCount);
 #endif
+static void GU_GeWaitAll();   // GUGeAsync.hpp
+extern bool gu_fbDirtyForGe;
 
 // What to do when a draw can't be queued -- either the queue is full, or the
 // entry is structurally unqueueable (a face with more verts than
@@ -1331,6 +1360,8 @@ static void GU_DrawLayerImmediate(TileLayer *layer)
 #endif
 }
 
+
+#include "GURoto.hpp"
 
 static bool GU_TryQueueLayerGPU(TileLayer *layer)
 {
@@ -1539,6 +1570,8 @@ static bool GU_TryQueueLayerGPU(TileLayer *layer)
         e->tileBatch.firstVert = firstVert;
         e->tileBatch.vertCount = used;
         e->tileBatch.bank      = bank;
+        e->tileBatch.roto      = 0;
+        e->tileBatch.submitted = 0;
         // Scissor to this band only, so bands cannot paint over each other.
         e->tileBatch.screenSnapshot = *currentScreen;
         e->tileBatch.screenSnapshot.clipBound_Y1 = byStart;
@@ -1562,6 +1595,11 @@ void RSDK::GU_QueueLayerDraw(TileLayer *layer)
     return;
 #endif
 
+    // A 0x0 layer draws nothing, but queued it would be a CPU entry that ends
+    // the GE-only prefix GU_GeTryEager submits early.
+    if (!layer->xsize || !layer->ysize)
+        return;
+
     GU_DrainQueueIfFull();
 
 #if GU_GPU_TILES
@@ -1569,6 +1607,8 @@ void RSDK::GU_QueueLayerDraw(TileLayer *layer)
     // rasterizer. Anything it declines -- ROTOZOOM, per-scanline palette
     // banks, no atlas, no room -- falls through to the path below.
     if (GU_TryQueueLayerGPU(layer))
+        return;
+    if (GU_TryQueueRotozoomGPU(layer))
         return;
 #endif
 
@@ -1658,6 +1698,8 @@ void GU_QueueLineDraw(int32 x1, int32 y1, int32 x2, int32 y2, uint32 color, int3
 // Queues a rotozoom (scaled/rotated) sprite draw. If the queue is full,
 // applies it immediately rather than dropping it -- same fallback
 // philosophy as the rest of this file.
+#include "GUSpriteGE.hpp"
+
 void GU_QueueRotozoomDraw(int32 left, int32 top, int32 xSize, int32 ySize, int32 fullX, int32 fullY, int32 fullSprX, int32 fullSprY, int32 deltaX,
                            int32 deltaY, int32 deltaXLen, int32 deltaYLen, int32 drawX, int32 drawY, int32 inkEffect, int32 alpha, int32 sheetID)
 {
@@ -1668,6 +1710,11 @@ void GU_QueueRotozoomDraw(int32 left, int32 top, int32 xSize, int32 ySize, int32
 #endif
 
     GU_DrainQueueIfFull();
+
+    // Pure scale, INK_NONE: a textured quad on the GE (GUSpriteGE.hpp).
+    if (GU_TryQueueScaledSpriteGE(left, top, xSize, ySize, fullX, fullY, fullSprX, fullSprY, deltaX, deltaY, deltaXLen, deltaYLen, drawX, drawY,
+                                  inkEffect, sheetID))
+        return;
 
     GUQueueEntry *e     = &gu_draw_queue[gu_draw_queue_count++];
     e->type             = GU_ENTRY_ROTOZOOM;
@@ -1699,6 +1746,8 @@ void GU_QueueRotozoomDraw(int32 left, int32 top, int32 xSize, int32 ySize, int32
 // NOTE: param order here is (b, g, r), matching DrawFace's own (unusual but
 // pre-existing) parameter order -- kept consistent end-to-end so nothing
 // needs reordering at the flush call site either.
+#include "GUFaceGE.hpp"
+
 void GU_QueueFaceDraw(Vector2 *vertices, int32 vertCount, int32 b, int32 g, int32 r, int32 alpha, int32 inkEffect)
 {
 #if GU_BYPASS_DRAW_QUEUE
@@ -1714,6 +1763,10 @@ void GU_QueueFaceDraw(Vector2 *vertices, int32 vertCount, int32 b, int32 g, int3
         return;
     }
 
+    // Faces that carry a depth (Draw3DScene's) go to the GE face batch.
+    if (gu_faceDepthValid && GU_TryQueueFaceGE(vertices, vertCount, b, g, r, inkEffect))
+        return;
+
     GU_DrainQueueIfFull();
 
     GUQueueEntry *e         = &gu_draw_queue[gu_draw_queue_count++];
@@ -1728,8 +1781,88 @@ void GU_QueueFaceDraw(Vector2 *vertices, int32 vertCount, int32 b, int32 g, int3
     memcpy(e->face.vertices, vertices, sizeof(Vector2) * vertCount);
 }
 
+extern "C" {
+// Defined in S3DFast.hpp, in Scene3D.cpp's translation unit.
+void S3D_LazyFrameTick();
+void S3D_LazyReport(FILE *h, double frameCount);
+
+// The GE depth packing, exported so S3DFast.hpp matches GU_QueueBlendedFaceDraw.
+int32 gu_faceDepthShiftExp = GU_DEPTH_SHIFT;
+int32 gu_faceDepthFarExp   = GU_DEPTH_FAR;
+#if GU_GPU_FACES && !GU_BYPASS_DRAW_QUEUE && !GU_TILE_PAD_TOGGLE
+int32 gu_faceBatchAvailable = 1;
+#else
+int32 gu_faceBatchAvailable = 0;
+#endif
+
+// Reserves `count` vertex records for the fast path, or returns NULL.
+void *GU_RecReserve(int32 count)
+{
+#if GU_GPU_FACES && !GU_BYPASS_DRAW_QUEUE && !GU_TILE_PAD_TOGGLE
+    if (!gu_rec_pool || count <= 0 || gu_rec_count + count > gu_rec_max)
+        return NULL;
+    GUFaceVertex *out = &gu_rec_pool[gu_rec_count];
+    gu_rec_count += count;
+    return out;
+#else
+    (void)count;
+    return NULL;
+#endif
+}
+
+// Reserves up to `want` indices and reports the count in *granted. Flushes
+// first if the queue could not take the batches plus a fallback: a flush after
+// the block is handed out would reset the pool under it.
+uint16 *GU_IdxReserve(int32 want, int32 *granted)
+{
+    *granted = 0;
+#if GU_GPU_FACES && !GU_BYPASS_DRAW_QUEUE && !GU_TILE_PAD_TOGGLE
+    if (!gu_idx_pool)
+        return NULL;
+    if (gu_draw_queue_count + 3 >= GU_DRAW_QUEUE_MAX)
+        GU_FlushDrawQueue();
+    const int32 space = gu_idx_max - gu_idx_count;
+    if (space < 3)
+        return NULL;
+    if (want > space)
+        want = space;
+    uint16 *out = &gu_idx_pool[gu_idx_count];
+    gu_idx_count += want;
+    *granted = want;
+    return out;
+#else
+    (void)want;
+    return NULL;
+#endif
+}
+
+// Gives back the unused tail of the most recent GU_IdxReserve.
+void GU_IdxRelease(int32 unused)
+{
+    if (unused > 0)
+        gu_idx_count -= unused;
+}
+
+// Queues indices into vertex records as one batch. GU_IdxReserve made room.
+void GU_QueueIdxBatch(const void *verts, int32 vertCount, const uint16 *indices, int32 indexCount)
+{
+    if (indexCount < 3)
+        return;
+    GUQueueEntry *e          = &gu_draw_queue[gu_draw_queue_count++];
+    e->type                  = GU_ENTRY_IDXBATCH;
+    e->idxBatch.screenSnapshot = *currentScreen;
+    e->idxBatch.verts        = verts;
+    e->idxBatch.indices      = indices;
+    e->idxBatch.vertCount    = vertCount;
+    e->idxBatch.indexCount   = indexCount;
+    e->idxBatch.submitted    = 0;
+}
+} // extern "C"
+static_assert(sizeof(GUFaceVertex) == 12, "S3DDrawVertex in S3DFast.hpp has this layout");
+
 // Queues a per-vertex-blended polygon fill. Same fallback philosophy as
 // GU_QueueFaceDraw.
+
 void GU_QueueBlendedFaceDraw(Vector2 *vertices, uint32 *colors, int32 vertCount, int32 alpha, int32 inkEffect)
 {
 #if GU_BYPASS_DRAW_QUEUE
@@ -1808,7 +1941,9 @@ void GU_QueueBlendedFaceDraw(Vector2 *vertices, uint32 *colors, int32 vertCount,
             // most recent -- otherwise any intervening draw would be
             // reordered behind these faces.
             GUQueueEntry *b = NULL;
-            if (gu_draw_queue_count > 0 && gu_draw_queue[gu_draw_queue_count - 1].type == GU_ENTRY_FACEBATCH)
+            if (gu_draw_queue_count > 0 && gu_draw_queue[gu_draw_queue_count - 1].type == GU_ENTRY_FACEBATCH
+                && gu_draw_queue[gu_draw_queue_count - 1].faceBatch.blend == 0
+                && !gu_draw_queue[gu_draw_queue_count - 1].faceBatch.submitted)
                 b = &gu_draw_queue[gu_draw_queue_count - 1];
             else {
                 b                          = &gu_draw_queue[gu_draw_queue_count++];
@@ -1816,6 +1951,8 @@ void GU_QueueBlendedFaceDraw(Vector2 *vertices, uint32 *colors, int32 vertCount,
                 b->faceBatch.screenSnapshot = *currentScreen;
                 b->faceBatch.firstVert     = gu_face_vert_count;
                 b->faceBatch.vertCount     = 0;
+                b->faceBatch.blend         = 0;
+                b->faceBatch.submitted     = 0;
             }
 
             // Screen-space already: Draw3DScene projects into 16.16 fixed
@@ -1967,6 +2104,13 @@ void GU_FlushDrawQueue()
         if (e->type != GU_ENTRY_SPRITE)
             GU_SyncSpriteBatchIfActive();
 
+        // Anything drawn by the CPU must land on top of every GE list before
+        // it; anything drawn by the GE just queues behind them.
+        if (e->type != GU_ENTRY_FACEBATCH && e->type != GU_ENTRY_TILEBATCH && e->type != GU_ENTRY_IDXBATCH) {
+            GU_GeWaitAll();
+            gu_fbDirtyForGe = true; // this entry draws on the CPU
+        }
+
         // Per-draw-type cost accounting. The entire GPU acceleration premise
         // depends on knowing WHICH draws actually cost the frame, and
         // measured frame time (~56ms) is far above what earlier (since
@@ -2044,7 +2188,18 @@ void GU_FlushDrawQueue()
                 GUFaceBatchEntry *fb      = &e->faceBatch;
                 ScreenInfo snapshotScreen = fb->screenSnapshot;
                 currentScreen             = &snapshotScreen;
-                GU_DrawFaceBatch(fb->firstVert, fb->vertCount);
+                if (fb->submitted)
+                    break; // already sent by GU_GeTryEager
+                GU_DrawFaceBatch(&gu_face_verts[fb->firstVert], fb->vertCount, fb->blend, NULL, 0);
+                break;
+            }
+            case GU_ENTRY_IDXBATCH: {
+                GUIdxBatchEntry *ib       = &e->idxBatch;
+                if (ib->submitted)
+                    break;
+                ScreenInfo snapshotScreen = ib->screenSnapshot;
+                currentScreen             = &snapshotScreen;
+                GU_DrawFaceBatch((const GUFaceVertex *)ib->verts, ib->vertCount, 0, ib->indices, ib->indexCount);
                 break;
             }
 #endif
@@ -2099,8 +2254,14 @@ void GU_FlushDrawQueue()
 #if GU_GPU_DEPTH
     gu_depthCleared = false;
 #endif
+    GU_GeWaitAll(); // the lists in flight read the pools reset below
+
     gu_face_vert_count   = 0;
     gu_tile_vert_count   = 0;
+    gu_roto_vert_count   = 0;
+    gu_rec_count         = 0;
+    gu_idx_count         = 0;
+    gu_clut_built        = 0;
     gu_draw_queue_count  = 0;
     gu_layer_queue_count = 0;
 }
@@ -2128,6 +2289,11 @@ static void Ge_Finish_Callback(int id, void *arg)
 // Own command buffer and pointer: ge_cmd_ptr belongs to FlipScreen, so this
 // saves and restores it rather than sharing.
 static u32 __attribute__((aligned(16))) ge_tri_cmd[GE_TRI_CMD_WORDS];
+#include "GUGeAsync.hpp"
+
+// Called by ProcessObjectDrawLists as it goes, so the GE can start on what has
+// been queued so far.
+void RSDK::GU_LayersQueued() { GU_GeTryEager(); }
 static GUFaceVertex __attribute__((aligned(16))) ge_tri_verts[3];
 
 #if GU_3D_TEST_TRIANGLE
@@ -2256,40 +2422,32 @@ static void GU_Draw3DTestTriangleRaw()
 }
 #endif
 #if GU_GPU_FACES
-// Draws one batch of GPU faces: the finished CPU frame goes out to VRAM, the
-// GE draws the triangles onto it there, and the result comes back.
-//
-// The round trip exists because the GE cannot render into main RAM at all
-// (see GU_Draw3DTestTriangleRaw for the evidence). It is per batch rather
-// than per frame because a batch is closed by any intervening CPU draw, and
-// those draws must see the GE's output -- but consecutive faces coalesce, so
-// a scene that draws its 3D in one run pays for exactly one round trip.
-static void GU_DrawFaceBatch(int32 firstVert, int32 vertCount)
+// Appends one batch of GPU faces to the open GE list (GUGeAsync.hpp): loose
+// vertices, or with `indices` an indexed batch over the given vertices.
+static void GU_DrawFaceBatch(const GUFaceVertex *verts, int32 vertCount, int32 blend, const uint16 *indices, int32 indexCount)
 {
-    if (vertCount < 3)
+    if (vertCount < 3 || (indices && indexCount < 3))
         return;
 
-    const u32 pitch    = screens[0].pitch;
-    const size_t bytes = (size_t)MANIA_HEIGHT * pitch * sizeof(u16);
-
-    const SceUInt64 t0 = gu_profilingEnabled ? sceKernelGetSystemTimeWide() : 0;
-
-    sceKernelDcacheWritebackInvalidateAll();
-    GU_FB_COPY_UP();
-
-    const SceUInt64 t1 = gu_profilingEnabled ? sceKernelGetSystemTimeWide() : 0;
-
+    const u32 pitch  = screens[0].pitch;
     const u32 target = (u32)gu_3d_scratch | 0x40000000; // uncached VRAM alias
-    GUFaceVertex *verts = &gu_face_verts[firstVert];
 
-    u32 *saved_ptr = ge_cmd_ptr;
-    ge_cmd_ptr     = ge_tri_cmd;
+    GU_ListOpen(96);
+    ++gu_listBatches;
 
     GE_CMD(FBP, target & 0x00FFFFFF);
     GE_CMD(FBW, ((target & 0xFF000000) >> 8) | pitch);
 
     GE_CMD(TME, 0);
-    GE_CMD(ABE, 0);
+    if (blend) {
+        // INK_BLEND: (src + dst) / 2, as fixed factors of 0x80.
+        GE_CMD(ABE, 1);
+        GE_CMD(BLEND, 0 | (10 << 4) | (10 << 8)); // GU_ADD, GU_FIX, GU_FIX
+        GE_CMD(SFIX, 0x808080);
+        GE_CMD(DFIX, 0x808080);
+    }
+    else
+        GE_CMD(ABE, 0);
     GE_CMD(ATE, 0);
     GE_CMD(ZTE, 0);
     GE_CMD(ZMSK, 1);
@@ -2332,44 +2490,32 @@ static void GU_DrawFaceBatch(int32 firstVert, int32 vertCount)
     GE_CMD(SCISSOR1, 0);
     GE_CMD(SCISSOR2, ((MANIA_HEIGHT - 1) << 10) | (MANIA_WIDTH - 1));
 
-    GE_CMD(VTYPE, (1 << 23) | (2 << 7) | (7 << 2));
+    GE_CMD(VTYPE, (1 << 23) | (2 << 7) | (7 << 2) | (indices ? (2 << 11) : 0)); // + GU_INDEX_16BIT
     GE_CMD(BASE, ((u32)verts & 0xFF000000) >> 8);
     GE_CMD(VADDR, (u32)verts & 0x00FFFFFF);
-    GE_CMD(PRIM, (3 << 16) | vertCount);
+    if (indices) {
+        GE_CMD(BASE, ((u32)indices & 0xFF000000) >> 8);
+        GE_CMD(IADDR, (u32)indices & 0x00FFFFFF);
+        GU_WbNote(indices, sizeof(uint16) * indexCount);
+    }
+    GE_CMD(PRIM, (3 << 16) | (indices ? indexCount : vertCount));
 
     // Restore what FlipScreen's present list assumes but never sets.
 #if GU_GPU_DEPTH
     GE_CMD(ZTE, 0);
     GE_CMD(ZMSK, 1);
 #endif
+    GE_CMD(ABE, 0);
     GE_CMD(TME, 1);
     GE_CMD(SCISSOR1, 0);
     GE_CMD(SCISSOR2, (PSP_SCREEN_HEIGHT << 10) | PSP_SCREEN_WIDTH);
     GE_CMD(TFLUSH, 0);
 
-    GE_CMD(FINISH, 0);
-    GE_CMD(END, 0);
-
-    ge_cmd_ptr = saved_ptr;
-
-    sceKernelDcacheWritebackRange(ge_tri_cmd, sizeof(ge_tri_cmd));
-    sceKernelDcacheWritebackRange(verts, sizeof(GUFaceVertex) * vertCount);
-
-    const int qid = sceGeListEnQueue(ge_tri_cmd, NULL, gecbid, NULL);
-    if (qid >= 0)
-        sceGeListSync(qid, 0);
-
-    const SceUInt64 t2 = gu_profilingEnabled ? sceKernelGetSystemTimeWide() : 0;
-
-    GU_FB_COPY_BACK();
-    GU_FB_GE_DONE();
+    GU_WbNote(verts, sizeof(GUFaceVertex) * vertCount);
 
     if (gu_profilingEnabled) {
-        const SceUInt64 t3 = sceKernelGetSystemTimeWide();
-        gu_faceDmaUsec += (t1 - t0) + (t3 - t2);
-        gu_faceGeUsec += t2 - t1;
         gu_faceBatchCount++;
-        gu_faceTriCount += vertCount / 3;
+        gu_faceTriCount += (indices ? indexCount : vertCount) / 3;
     }
 }
 
@@ -2416,7 +2562,7 @@ static void GU_BuildTileAtlas()
     // Did the source tileset and the packed atlas actually contain
     // anything? A uniform on-screen colour means every texel read as
     // the same index, so check both ends of the copy.
-    if (changed > 64) {
+    if (gu_profilingEnabled && changed > 64) {
         int32 srcNonZero = 0, dstNonZero = 0;
         for (int32 i = 0; i < TILE_COUNT * TILE_DATASIZE; i += 7)
             if (tilesetPixels[i]) ++srcNonZero;
@@ -2432,25 +2578,33 @@ static void GU_BuildTileAtlas()
 }
 
 // Emits the GE commands that bind the atlas as an 8-bit CLUT texture.
-// Appended to a list already in progress.
+// Appended to a list already in progress. Each palette bank has its own CLUT,
+// built once per flush: batches in one list can use different banks, and the
+// GE only reads them when the list runs.
 static void GU_EmitTileTextureState(int32 bank)
 {
-    // CLUT for this palette bank, built with the same 5551 conversion the
-    // sprite path uses -- index 0 gets alpha 0, which is RSDK's transparent.
-    uint16 *pal = fullPalette[bank];
-    for (int32 i = 0; i < 256; ++i) {
-        const uint16 c = pal[i];
-        const uint16 r5 = c & 0x1F, g6 = (c >> 5) & 0x3F, b5 = (c >> 11) & 0x1F;
-        gu_clut[i] = r5 | ((g6 >> 1) << 5) | (b5 << 10) | (i == 0 ? 0 : (1 << 15));
+    if (bank < 0 || bank >= PALETTE_BANK_COUNT)
+        bank = 0;
+    uint16 *clut = gu_clut_banks[bank];
+    if (!(gu_clut_built & (1u << bank))) {
+        gu_clut_built |= 1u << bank;
+        // Same 5551 conversion the sprite path uses -- index 0 gets alpha 0,
+        // which is RSDK's transparent.
+        const uint16 *pal = fullPalette[bank];
+        for (int32 i = 0; i < 256; ++i) {
+            const uint16 c = pal[i];
+            const uint16 r5 = c & 0x1F, g6 = (c >> 5) & 0x3F, b5 = (c >> 11) & 0x1F;
+            clut[i] = r5 | ((g6 >> 1) << 5) | (b5 << 10) | (i == 0 ? 0 : (1 << 15));
+        }
+        sceKernelDcacheWritebackRange(clut, 256 * sizeof(uint16));
     }
-    sceKernelDcacheWritebackRange(gu_clut, sizeof(gu_clut));
 
     // NOT the uncached alias. CBPH is a 4-bit field holding address bits
     // 24-27 (pspsdk: (cbp >> 8) & 0xf0000), so 0x4B... truncates to 0x4 and
     // the GE reads the CLUT from the wrong address -- every texel then
     // resolves to entry 0, which is transparent, and the whole layer
-    // disappears. The writeback below is what keeps it coherent.
-    const u32 clutAddr  = (u32)gu_clut;
+    // disappears. The writeback above is what keeps it coherent.
+    const u32 clutAddr  = (u32)clut;
     const u32 atlasAddr = (u32)gu_tile_atlas;         // already a VRAM address
 
     GE_CMD(TME, 1);
@@ -2564,30 +2718,18 @@ static void GU_DrawTileAtlasTest()
 // GE cannot render into main RAM, so the frame goes out, gets drawn on, and
 // comes back.
 
-// Draws a run of consecutive queued tile batches through a single VRAM round
-// trip. The round trip is the entire cost of this path -- measured at GHZ1 it
-// is 3.83ms of DMA against 0.08ms of actual GE work -- so doing one per batch
-// made the GPU path slower than the CPU rasterizer it replaced. Batch state
-// (scissor, palette, texture) is per-batch inside the one list.
+// Appends a run of consecutive queued tile batches to the open GE list
+// (GUGeAsync.hpp). Batch state (scissor, palette, texture) is per batch.
 static void GU_DrawTileBatchRun(int32 firstEntry, int32 entryCount)
 {
     if (entryCount <= 0 || !gu_tile_atlas_ok)
         return;
 
-    const u32 pitch    = screens[0].pitch;
-    const size_t bytes = (size_t)MANIA_HEIGHT * pitch * sizeof(u16);
-
-    const SceUInt64 t0 = gu_profilingEnabled ? sceKernelGetSystemTimeWide() : 0;
-
-    sceKernelDcacheWritebackInvalidateAll();
-    GU_FB_COPY_UP();
-
-    const SceUInt64 t1 = gu_profilingEnabled ? sceKernelGetSystemTimeWide() : 0;
-
+    const u32 pitch  = screens[0].pitch;
     const u32 target = (u32)gu_3d_scratch | 0x40000000;
 
-    u32 *saved_ptr = ge_cmd_ptr;
-    ge_cmd_ptr     = ge_tri_cmd;
+    GU_ListOpen(entryCount * GE_TRI_PER_BATCH + GE_TRI_RUN_HEADER + GE_TRI_RUN_FOOTER + 8);
+    u32 *const cmdBase = gu_listBase;
 
     GE_CMD(FBP, target & 0x00FFFFFF);
     GE_CMD(FBW, ((target & 0xFF000000) >> 8) | pitch);
@@ -2600,31 +2742,40 @@ static void GU_DrawTileBatchRun(int32 firstEntry, int32 entryCount)
     GE_CMD(ATE, 1);
     GE_CMD(ATST, (GU_GREATER) | (0 << 8) | (0xFF << 16)); // index 0 is transparent
 
-    int32 drawn = 0;
+    u32 wbLo = 0, wbHi = 0;
     for (int32 k = 0; k < entryCount; ++k) {
         const GUTileBatchEntry *tb = &gu_draw_queue[firstEntry + k].tileBatch;
-        if (tb->vertCount < 2)
+        if (tb->vertCount < 2 || tb->submitted)
             continue;
 
         // Never let a batch push the FINISH/END terminators out of the buffer.
-        if ((ge_cmd_ptr - ge_tri_cmd) > (GE_TRI_CMD_WORDS - GE_TRI_PER_BATCH - GE_TRI_RUN_FOOTER - 2))
-            break;
+        if ((ge_cmd_ptr - cmdBase) > (GE_TRI_CMD_WORDS - GE_TRI_PER_BATCH - GE_TRI_RUN_FOOTER - 2))
+            break; // GU_ListOpen reserved room for the whole run, so this never fires
+        ++gu_listBatches;
 
-        const GUTexVertex *verts = &gu_tile_verts[tb->firstVert];
+        const void *verts = tb->roto ? (const void *)&gu_roto_verts[tb->firstVert] : (const void *)&gu_tile_verts[tb->firstVert];
 
         GE_CMD(SCISSOR1, (tb->screenSnapshot.clipBound_Y1 << 10) | tb->screenSnapshot.clipBound_X1);
         GE_CMD(SCISSOR2, ((tb->screenSnapshot.clipBound_Y2 - 1) << 10) | (tb->screenSnapshot.clipBound_X2 - 1));
 
         GU_EmitTileTextureState(tb->bank);
+        if (tb->roto == 2)
+            GU_EmitSheetTexture(tb->sheet); // the sheet instead of the atlas
 
-        GE_CMD(VTYPE, (1 << 23) | (2 << 7) | 2);
+        // Rotozoom and sprite batches have float texture coordinates, and
+        // their vertices are written back where they are built.
+        GE_CMD(VTYPE, tb->roto ? ((1 << 23) | (2 << 7) | 3) : ((1 << 23) | (2 << 7) | 2));
         GE_CMD(BASE, ((u32)verts & 0xFF000000) >> 8);
         GE_CMD(VADDR, (u32)verts & 0x00FFFFFF);
-        GE_CMD(PRIM, (6 << 16) | tb->vertCount);
+        GE_CMD(PRIM, (tb->roto == 1 ? (1 << 16) : (6 << 16)) | tb->vertCount); // 1: floor lines; 0, 2: sprites
 
-        sceKernelDcacheWritebackRange((void *)verts, sizeof(GUTexVertex) * tb->vertCount);
-        ++drawn;
-
+        if (!tb->roto) {
+            // Consecutive tile batches are consecutive in the quad buffer, so
+            // the whole run is one writeback range.
+            const u32 lo = (u32)verts, hi = lo + sizeof(GUTexVertex) * tb->vertCount;
+            if (wbLo == 0 || lo < wbLo) wbLo = lo;
+            if (hi > wbHi) wbHi = hi;
+        }
         if (gu_profilingEnabled) {
             gu_tileBatchCount++;
             gu_tileQuadCount += tb->vertCount / 2;
@@ -2639,28 +2790,8 @@ static void GU_DrawTileBatchRun(int32 firstEntry, int32 entryCount)
     GE_CMD(SCISSOR2, (PSP_SCREEN_HEIGHT << 10) | PSP_SCREEN_WIDTH);
     GE_CMD(TFLUSH, 0);
 
-    GE_CMD(FINISH, 0);
-    GE_CMD(END, 0);
-
-    ge_cmd_ptr = saved_ptr;
-
-    if (drawn) {
-        sceKernelDcacheWritebackRange(ge_tri_cmd, sizeof(ge_tri_cmd));
-        const int qid = sceGeListEnQueue(ge_tri_cmd, NULL, gecbid, NULL);
-        if (qid >= 0)
-            sceGeListSync(qid, 0);
-    }
-
-    const SceUInt64 t2 = gu_profilingEnabled ? sceKernelGetSystemTimeWide() : 0;
-
-    GU_FB_COPY_BACK();
-    GU_FB_GE_DONE();
-
-    if (gu_profilingEnabled) {
-        const SceUInt64 t3 = sceKernelGetSystemTimeWide();
-        gu_tileDmaUsec += (t1 - t0) + (t3 - t2);
-        gu_tileGeUsec += t2 - t1;
-    }
+    if (wbHi > wbLo)
+        GU_WbNote((const void *)wbLo, wbHi - wbLo);
 }
 
 static void GU_DrawTileBatch(int32 firstVert, int32 vertCount, int32 bank)
@@ -3245,10 +3376,27 @@ printf("Mania Pitch is %i",MANIA_PITCH);
       gu_tile_atlas = gu_tex_arena;
       gu_tex_arena += (size_t)GU_ATLAS_DIM * GU_ATLAS_DIM;
 
+      // VRAM pools for the GE paths, carved before the arena is sized below:
+      // rotozoom vertices (GURoto.hpp), the command-list ring (GUGeAsync.hpp)
+      // and the Scene3D fast path's vertex records (S3DFast.hpp). Records are
+      // fetched by index, which is much slower out of main RAM.
+      gu_roto_verts    = (GURotoVertex *)gu_tex_arena;
+      gu_roto_vert_max = GU_ROTO_VERT_MAX;
+      gu_tex_arena += (size_t)GU_ROTO_VERT_MAX * sizeof(GURotoVertex);
+
+      gu_geRing = (u32 *)gu_tex_arena;
+      gu_tex_arena += (size_t)GU_GE_RING * GE_TRI_CMD_WORDS * sizeof(u32);
+      for (int32 gi = 0; gi < GU_GE_RING; ++gi)
+          gu_geRingQid[gi] = -1;
+
+      gu_rec_pool = (GUFaceVertex *)gu_tex_arena;
+      gu_rec_max  = 8192;
+      gu_tex_arena += (size_t)8192 * sizeof(GUFaceVertex);
+
       const size_t vramTotal   = 2 * 1024 * 1024;
       const size_t vramCached  = 0x04000000;
       const size_t usedBefore  = (size_t)((u8 *)gu_tex_arena - (u8 *)vramCached);
-      const size_t safetyMargin = 256 * 1024;
+      const size_t safetyMargin = 64 * 1024; // leaves the GE sprite path room for its sheets
 
       gu_tex_arena_size = (usedBefore + safetyMargin < vramTotal)
                                ? (u32)(vramTotal - usedBefore - safetyMargin)
@@ -3311,6 +3459,10 @@ printf("Mania Pitch is %i",MANIA_PITCH);
           }
       }
 #endif
+      // Indices for the fast path's batches (S3DFast.hpp); the Special Stage
+      // uses ~14,000 a frame.
+      gu_idx_pool = (uint16 *)memalign(16, 30720 * sizeof(uint16));
+      gu_idx_max  = gu_idx_pool ? 30720 : 0;
       printf("RSDKv5 PSP: gpu face verts = %d (%d bytes), free mem = %d\n",
              (int)gu_face_vert_max, (int)(gu_face_vert_max * (int)sizeof(GUFaceVertex)),
              (int)sceKernelTotalFreeMemSize());
@@ -3380,13 +3532,14 @@ void RenderDevice::CopyFrameBuffer()
   // single contained pass rather than scattered individual draws. This is
   // where the actual CPU pixel writes for the frame happen now that draws
   {
-      if (gu_layerLogFrame < 3) {
+      if (gu_profilingEnabled && gu_layerLogFrame < 3) {
           if (!gu_layerLog) gu_layerLog = fopen("layers.log", "w");
           ++gu_layerLogFrame;
           if (gu_layerLog) { fprintf(gu_layerLog, "--- frame %d scene=%d ---\n", (int)gu_layerLogFrame, (int)sceneInfo.listPos); fflush(gu_layerLog); }
       } else if (gu_layerLog) { fclose(gu_layerLog); gu_layerLog = NULL; }
   }
   // are deferred (Stage 0), so it must run BEFORE the transfer below.
+  S3D_LazyFrameTick();
   GU_FlushDrawQueue();
 
 #if GU_GPU_TILES || GU_TILE_SELFTEST || GU_TILE_ATLAS_TEST
@@ -3474,6 +3627,8 @@ void RenderDevice::CopyFrameBuffer()
   // and before the surface is written back and DMA'd out.
   GU_Draw3DTestTriangleRaw();
 #endif
+
+  GU_GeWaitAll(); // nothing may still be drawing into what the DMA below sends
 
   // The rasterizer's writes are sitting in the CPU data cache, so they have
   // to be written back before the DMA engine -- which reads memory directly,
@@ -3590,7 +3745,7 @@ static void GU_SampleFramePacing()
     gu_paceLast = now;
     ++gu_paceFrames;
 
-    if (gu_paceFrames >= GU_PACE_REPORT_AT && !gu_paceReported) {
+    if (gu_profilingEnabled && gu_paceFrames >= GU_PACE_REPORT_AT && !gu_paceReported) {
         gu_paceReported = true;
         FILE *pf = fopen("pacing.log", "w");
         if (pf) {
@@ -3687,10 +3842,8 @@ static void GU_UpdateFPSCounter()
                 fprintf(h, "     queue: peak %4d / %d  drains %d  (drains > 0 means the frame exceeded the queue)\n", gu_queuePeak,
                         GU_DRAW_QUEUE_MAX, gu_queueDrains);
 #if GU_GPU_FACES
-                fprintf(h, "     gpu faces: %6.1f tri  %4.1f batches  dma %5.2f  ge %5.2f  (per frame)\n",
-                        (double)gu_faceTriCount / frameCount, (double)gu_faceBatchCount / frameCount,
-                        (double)gu_faceDmaUsec / 1000.0 / frameCount, (double)gu_faceGeUsec / 1000.0 / frameCount);
-                gu_faceDmaUsec = gu_faceGeUsec = 0;
+                fprintf(h, "     gpu faces: %6.1f tri  %4.1f batches  (per frame)\n", (double)gu_faceTriCount / frameCount,
+                        (double)gu_faceBatchCount / frameCount);
                 gu_faceBatchCount = gu_faceTriCount = 0;
                 fprintf(h, "     layers: hscroll %5.2f  vscroll %5.2f  rotozoom %5.2f  basic %5.2f  |  bands/layer %5.1f\n",
                         (double)gu_layerTypeUsec[0] / 1000.0 / frameCount, (double)gu_layerTypeUsec[1] / 1000.0 / frameCount,
@@ -3699,6 +3852,17 @@ static void GU_UpdateFPSCounter()
                 gu_layerTypeUsec[0] = gu_layerTypeUsec[1] = gu_layerTypeUsec[2] = gu_layerTypeUsec[3] = 0;
                 gu_layerBands = gu_layerBandSamples = 0;
 #if GU_GPU_TILES
+                fprintf(h, "     ge async: %.1f lists  %.1f eager  %.1f waits  waited %5.2f ms  eager build %5.2f ms  faces %.0f  sprites %.0f (declined %d)\n",
+                        (double)gu_geLists / frameCount, (double)gu_geEager / frameCount, (double)gu_geWaits / frameCount,
+                        (double)gu_geWaitUsec / 1000.0 / frameCount, (double)gu_geEagerUsec / 1000.0 / frameCount,
+                        (double)gu_faceGeRouted / frameCount, (double)gu_sprGeRouted / frameCount, (int)gu_sprGeDecline);
+                gu_geLists = gu_geEager = gu_geWaits = gu_faceGeRouted = gu_sprGeRouted = gu_sprGeDecline = 0;
+                gu_geWaitUsec = gu_geEagerUsec = 0;
+                fprintf(h, "     roto gpu: %.0f segs  %.1f rows  %.2f layers  build %5.2f ms  declined %d\n", (double)gu_rotoGpuSegs / frameCount,
+                        (double)gu_rotoGpuRows / frameCount, (double)gu_rotoGpuLayers / frameCount,
+                        (double)gu_rotoGpuUsec / 1000.0 / frameCount, (int)gu_rotoGpuDecline);
+                gu_rotoGpuSegs = gu_rotoGpuRows = gu_rotoGpuLayers = gu_rotoGpuDecline = 0;
+                gu_rotoGpuUsec = 0;
                 fprintf(h, "     gpu tiles: %6.1f quads %4.1f batches  dma %5.2f  ge %5.2f  (per frame)\n",
                         (double)gu_tileQuadCount / frameCount, (double)gu_tileBatchCount / frameCount,
                         (double)gu_tileDmaUsec / 1000.0 / frameCount, (double)gu_tileGeUsec / 1000.0 / frameCount);
@@ -3780,6 +3944,7 @@ static void GU_UpdateFPSCounter()
                     fprintf(h, "     scene3d: mesh(transform) %6.2f  sort %6.2f  draw %6.2f\n", (double)gu_s3dMeshUsec / 1000.0 / frameCount,
                             (double)gu_s3dSortUsec / 1000.0 / frameCount, (double)gu_s3dDrawUsec / 1000.0 / frameCount);
                     gu_s3dMeshUsec = gu_s3dSortUsec = gu_s3dDrawUsec = 0;
+                    S3D_LazyReport(h, (double)frameCount);
                 }
                 fclose(h);
             }
@@ -3828,7 +3993,7 @@ void RenderDevice::FlipScreen()
                               PSP_DISPLAY_SETBUF_NEXTFRAME);
         {
             static int32 logged = 0;
-            if (logged < 4) {
+            if (gu_profilingEnabled && logged < 4) {
                 ++logged;
                 FILE *dl = fopen("disp_dbg.log", logged == 1 ? "w" : "a");
                 if (dl) {

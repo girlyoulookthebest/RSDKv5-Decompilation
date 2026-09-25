@@ -39,6 +39,7 @@ int32 gu_s3dDepthMin = 0x7FFFFFFF;
 int32 gu_s3dDepthMax = -0x7FFFFFFF;
 #if RETRO_RENDERDEVICE_GU
 extern int32 gu_faceDepth;   // see GURenderDevice.cpp
+extern int32 gu_faceDepthValid; // GUFaceGE.hpp
 #endif
 int32 gu_s3dVertsXf   = 0;  // vertices put through the transform
 int32 gu_s3dFacesIn   = 0;  // faces reaching the draw phase
@@ -644,12 +645,23 @@ uint16 RSDK::Create3DScene(const char *name, uint16 vertexLimit, uint8 scope)
 
     return id;
 }
+#include "S3DFast.hpp"
+
 void RSDK::AddModelToScene(uint16 modelFrames, uint16 sceneIndex, uint8 drawMode, Matrix *matWorld, Matrix *matNormals, color color)
 {
     // Counted into the same bucket as AddMeshFrameToScene: both are per-vertex
     // transform work, and only the mesh variant was instrumented before --
     // which left a large slice of the Special Stage's draw-list time invisible.
     S3D_TIME_BEGIN(gu_s3dMeshUsec);
+#if S3D_FAST
+    // Transform the unique vertices once and remember the index list
+    // instead of expanding per index. Everything this declines falls
+    // through to the stock loops below, unchanged.
+    if (S3D_TryAddModelLazy(modelFrames, sceneIndex, drawMode, matWorld, matNormals, color)) {
+        S3D_TIME_END(gu_s3dMeshUsec);
+        return;
+    }
+#endif
     if (modelFrames < MODEL_COUNT && sceneIndex < SCENE3D_COUNT) {
         if (matWorld) {
             Model *mdl            = &modelList[modelFrames];
@@ -851,6 +863,12 @@ void RSDK::AddMeshFrameToScene(uint16 modelFrames, uint16 sceneIndex, Animator *
                                color color)
 {
     S3D_TIME_BEGIN(gu_s3dMeshUsec);
+#if S3D_FAST
+    if (S3D_TryAddMeshFrameLazy(modelFrames, sceneIndex, animator, drawMode, matWorld, matNormals, color)) {
+        S3D_TIME_END(gu_s3dMeshUsec);
+        return;
+    }
+#endif
     if (modelFrames < MODEL_COUNT && sceneIndex < SCENE3D_COUNT) {
         if (matWorld && animator) {
             Model *mdl            = &modelList[modelFrames];
@@ -1104,6 +1122,19 @@ void RSDK::Draw3DScene(uint16 sceneID)
 #if RETRO_S3D_LOG
         ++gu_s3dDrawCalls;
         gu_s3dFacesSeen += scn->faceCount;
+#endif
+#if S3D_FAST
+        {
+            // Scenes built entirely from fast-path runs are projected,
+            // shaded and emitted here. Anything else (mixed content, a
+            // different draw mode) is put back into the scene's vertex
+            // array first and falls through to the stock path below.
+            S3D_TIME_BEGIN(gu_s3dDrawUsec);
+            const bool32 s3dLazyDrawn = S3D_TryDrawLazy(sceneID, scn, entity);
+            S3D_TIME_END(gu_s3dDrawUsec);
+            if (s3dLazyDrawn)
+                return;
+        }
 #endif
         // Setup face buffer.
         // Each face's depth is an average of the depth of its vertices.
@@ -1419,8 +1450,12 @@ void RSDK::Draw3DScene(uint16 sceneID)
                     }
 
                     if (v < 0xFF) {
+                        // With a depth, DrawFace can go to the GE face batch (GUFaceGE.hpp).
+                        gu_faceDepth      = scn->faceBuffer[f].depth;
+                        gu_faceDepthValid = 1;
                         DrawFace(vertPos, *vertCnt, (drawVert[0].color >> 16) & 0xFF, (drawVert[0].color >> 8) & 0xFF,
                                  (drawVert[0].color >> 0) & 0xFF, entity->alpha, entity->inkEffect);
+                        gu_faceDepthValid = 0;
                     }
                     vertCnt++;
                 }

@@ -156,10 +156,16 @@ inline void MatrixCopy(Matrix *matDst, Matrix *matSrc) { memcpy(matDst, matSrc, 
 
 uint16 LoadMesh(const char *filepath, uint8 scope);
 uint16 Create3DScene(const char *name, uint16 faceCnt, uint8 scope);
+
+// Releases any fast-path geometry this scene is holding (see S3DFast.hpp).
+// Defined in Scene3D.cpp; a no-op in builds without the GU render device.
+void S3D_LazyReset(uint16 sceneID);
 inline void Prepare3DScene(uint16 sceneID)
 {
     if (sceneID < SCENE3D_COUNT) {
         Scene3D *scn = &scene3DList[sceneID];
+
+        S3D_LazyReset(sceneID);
 
         // Clear only the region the previous use actually touched, not the
         // whole 4096-entry capacity.
