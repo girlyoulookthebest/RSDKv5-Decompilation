@@ -10,12 +10,24 @@ namespace RSDK
 #define MIX_BUFFER_SIZE (0x800)
 #define SAMPLE_FORMAT   float
 
+// PSP: sound effects stay 16-bit, as the files hold them, instead of being
+// widened to float. Float filled the SFX pool, and stages lost up to 28
+// sounds to it. Music streams are still float.
+#if RETRO_PLATFORM == RETRO_PSP
+typedef int16 SFX_SAMPLE;
+#define SFX_SAMPLE_SCALE (1.0f / 0x8000)
+#else
+typedef float SFX_SAMPLE;
+#define SFX_SAMPLE_SCALE (1.0f)
+#endif
+
 #define AUDIO_FREQUENCY (44100)
 #define AUDIO_CHANNELS  (2)
 
 struct SFXInfo {
     RETRO_HASH_MD5(hash);
-    float *buffer;
+    float *buffer; // the music stream's buffer (slot SFX_COUNT - 1)
+    SFX_SAMPLE *samples;
     size_t length;
     int32 playCount;
     uint8 maxConcurrentPlays;
@@ -24,6 +36,7 @@ struct SFXInfo {
 
 struct ChannelInfo {
     float *samplePtr;
+    SFX_SAMPLE *sfxPtr;
     float pan;
     float volume;
     int32 speed;

@@ -42,19 +42,25 @@ bool32 RSDK::InitStorage()
     dataStorage[DATASET_MUS].storageLimit = 0;
     dataStorage[DATASET_SFX].storageLimit = 0;
     #elif RETRO_PLATFORM == RETRO_PSP
-    // The desktop-sized SFX/MUS pools (20MiB + ~4.19MiB) don't fit in the PSP's
-    // available heap alongside the other pools. LoadStream() reads a whole
-    // compressed music file into this pool at once (not a rolling window), so
-    // this needs to comfortably fit the largest track's file size.
-    dataStorage[DATASET_MUS].storageLimit = 3 * 1024 * 1024;  // 3 Mib
-    dataStorage[DATASET_SFX].storageLimit = 15 * 1024 * 1024;  // 15 Mib -- trimmed another 1MiB to give TMP room below
+    // The desktop pools don't fit in the PSP's heap. These are sized from each
+    // pool's measured peak across every scene, with the total kept the same.
+    //
+    // LoadStream() reads a whole compressed music file into MUS at once (not a
+    // rolling window). The largest, Blue Spheres, is ~3.7MiB, and with the
+    // vorbis buffer needs ~4.2MiB; at 3MiB it never loaded and played silent.
+    dataStorage[DATASET_MUS].storageLimit = 4608 * 1024;  // 4.5 Mib
+    // SFX are 16-bit on PSP (see SFX_SAMPLE): the worst stage (SSZ2) needs
+    // ~11.4MiB. As float it needed ~22.8MiB and stages lost up to 28 sounds.
+    dataStorage[DATASET_SFX].storageLimit = 12800 * 1024;  // 12.5 Mib
+    // Peaks at ~16.4MiB (Encore MSZ1), which overflowed the desktop 16MiB.
+    dataStorage[DATASET_STG].storageLimit = 17920 * 1024;  // 17.5 Mib
     // LoadSceneAssets() allocates a temp EntityBase array (SCENEENTITY_COUNT *
     // sizeof(EntityBase) = 2048 * 1112 = ~2.17MiB) from this pool on every
     // scene load. At 2MiB that allocation always failed silently (AllocateStorage
     // returns NULL on failure with no error signaled) and the caller dereferenced
     // the NULL pointer -- crashed hard on real hardware, but PPSSPP tolerated the
     // bad access silently, which is why this only ever showed up on real PSP.
-    dataStorage[DATASET_TMP].storageLimit = 3 * 1024 * 1024;  // 3 Mib -- must comfortably exceed the ~2.29MiB peak this pool needs during scene load
+    dataStorage[DATASET_TMP].storageLimit = 2560 * 1024;  // 2.5 Mib -- measured peak is ~2.18MiB in every scene
     #endif
 
     for (int32 s = 0; s < DATASET_MAX; ++s) {

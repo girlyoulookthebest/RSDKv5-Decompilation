@@ -71,7 +71,7 @@ void AudioDeviceBase::ProcessAudioMixing(void *stream, int32 length)
             case CHANNEL_IDLE: break;
 
             case CHANNEL_SFX: {
-                SAMPLE_FORMAT *sfxBuffer = &channel->samplePtr[channel->bufferPos];
+                SFX_SAMPLE *sfxBuffer = &channel->sfxPtr[channel->bufferPos];
 
                 float volL = channel->volume, volR = channel->volume;
                 if (channel->pan < 0.0f)
@@ -92,8 +92,9 @@ void AudioDeviceBase::ProcessAudioMixing(void *stream, int32 length)
                         sample = 0;
                     else
 #endif
-                        sample = (sfxBuffer[1] - sfxBuffer[0]) * linearInterpolationLookup[speedPercent / LINEAR_INTERPOLATION_LOOKUP_DIVISOR]
-                                 + sfxBuffer[0];
+                        sample = ((sfxBuffer[1] - sfxBuffer[0]) * linearInterpolationLookup[speedPercent / LINEAR_INTERPOLATION_LOOKUP_DIVISOR]
+                                  + sfxBuffer[0])
+                                 * SFX_SAMPLE_SCALE;
 
                     speedPercent += channel->speed;
                     sfxBuffer += FROM_FIXED(speedPercent);
@@ -114,7 +115,7 @@ void AudioDeviceBase::ProcessAudioMixing(void *stream, int32 length)
                             channel->bufferPos -= (uint32)channel->sampleLength;
                             channel->bufferPos += channel->loop;
 
-                            sfxBuffer = &channel->samplePtr[channel->bufferPos];
+                            sfxBuffer = &channel->sfxPtr[channel->bufferPos];
                         }
                     }
                 }
@@ -387,13 +388,13 @@ void RSDK::LoadSfxToSlot(char *filename, uint8 slot, uint8 plays, uint8 scope)
                 if (sampleBits == 16)
                     length /= 2;
 
-                AllocateStorage((void **)&sfxList[slot].buffer, sizeof(float) * length, DATASET_SFX, false);
+                AllocateStorage((void **)&sfxList[slot].samples, sizeof(SFX_SAMPLE) * length, DATASET_SFX, false);
                 sfxList[slot].length = length;
 
 #if !RETRO_USE_ORIGINAL_CODE
                 // AllocateStorage() silently leaves the buffer NULL if the SFX pool is full
                 // instead of failing loudly, so the write loop below would otherwise segfault.
-                if (!sfxList[slot].buffer) {
+                if (!sfxList[slot].samples) {
                     sfxList[slot].scope = SCOPE_NONE;
                     CloseFile(&info);
                     PrintLog(PRINT_ERROR, "Not enough SFX storage to load: %s", filename);
@@ -401,17 +402,23 @@ void RSDK::LoadSfxToSlot(char *filename, uint8 slot, uint8 plays, uint8 scope)
                 }
 #endif
 
-                // Convert the sample data to F32 format
-                float *buffer = (float *)sfxList[slot].buffer;
+                // Convert the sample data to SFX_SAMPLE. As 16-bit, a sample keeps the
+                // value the float path gives it: 8-bit v is (v - 0x80) / 0x80, 16-bit
+                // is v / 0x8000 * 0.75, both then read back times SFX_SAMPLE_SCALE.
+                SFX_SAMPLE *buffer = sfxList[slot].samples;
                 if (sampleBits == 8) {
-                    // 8-bit sample. Convert from U8 to S8, and then from S8 to F32.
+                    // 8-bit sample. Convert from U8 to S8, and then to SFX_SAMPLE.
                     for (int32 s = 0; s < length; ++s) {
                         int32 sample = ReadInt8(&info);
-                        *buffer++    = (sample - 0x80) / (float)0x80;
+#if RETRO_PLATFORM == RETRO_PSP
+                        *buffer++ = (int16)((sample - 0x80) << 8);
+#else
+                        *buffer++ = (sample - 0x80) / (float)0x80;
+#endif
                     }
                 }
                 else {
-                    // 16-bit sample. Convert from S16 to F32.
+                    // 16-bit sample. Convert from S16 to SFX_SAMPLE.
                     for (int32 s = 0; s < length; ++s) {
                         // For some reason, the game performs sign-extension manually here.
                         // Note that this is different from the 8-bit format's unsigned-to-signed conversion.
@@ -420,7 +427,11 @@ void RSDK::LoadSfxToSlot(char *filename, uint8 slot, uint8 plays, uint8 scope)
                         if (sample > 0x7FFF)
                             sample = (sample & 0x7FFF) - 0x8000;
 
+#if RETRO_PLATFORM == RETRO_PSP
+                        *buffer++ = (int16)((sample * 3) >> 2);
+#else
                         *buffer++ = (sample / (float)0x8000) * 0.75f;
+#endif
                     }
                 }
             }
@@ -511,7 +522,7 @@ int32 RSDK::PlaySfx(uint16 sfx, uint32 loopPoint, uint32 priority)
 
     channels[slot].state        = CHANNEL_SFX;
     channels[slot].bufferPos    = 0;
-    channels[slot].samplePtr    = sfxList[sfx].buffer;
+    channels[slot].sfxPtr       = sfxList[sfx].samples;
     channels[slot].sampleLength = sfxList[sfx].length;
     channels[slot].volume       = 1.0f;
     channels[slot].pan          = 0.0f;
