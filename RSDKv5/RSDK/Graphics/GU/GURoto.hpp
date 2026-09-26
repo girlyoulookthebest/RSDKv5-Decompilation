@@ -63,7 +63,7 @@ static bool GU_TryQueueRotozoomGPU(TileLayer *layer)
     (void)layer;
     return false;
 #else
-    if (layer->type != LAYER_ROTOZOOM)
+    if (layer->type != LAYER_ROTOZOOM || gu_emulator)
         return false;
     if (!gu_roto_verts)
         return false;

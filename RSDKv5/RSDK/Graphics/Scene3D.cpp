@@ -1233,7 +1233,7 @@ void RSDK::Draw3DScene(uint16 sceneID)
         if (s3dMode != 2)
 #endif
 #if !GU_S3D_KEEP_SORT
-        if (false)
+        if (!gu_faceBatchAvailable) // no GE depth test (under an emulator)
 #endif
         std::sort(scn->faceBuffer, scn->faceBuffer + scn->faceCount, [](const Scene3DFace &a, const Scene3DFace &b) {
             if (a.depth != b.depth)

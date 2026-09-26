@@ -59,7 +59,7 @@ static bool GU_TryQueueScaledSpriteGE(int32 left, int32 top, int32 xSize, int32 
     (void)deltaXLen; (void)deltaYLen; (void)drawX; (void)drawY; (void)inkEffect; (void)sheetID;
     return false;
 #else
-    if (inkEffect != INK_NONE || deltaY != 0 || deltaXLen != 0 || deltaX == 0 || deltaYLen == 0)
+    if (gu_emulator || inkEffect != INK_NONE || deltaY != 0 || deltaXLen != 0 || deltaX == 0 || deltaYLen == 0)
         return false;
     if (!gu_roto_verts || !gu_tile_atlas_ok)
         return false;

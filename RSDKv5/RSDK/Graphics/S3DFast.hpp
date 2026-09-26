@@ -348,7 +348,9 @@ static int32 s3dVfpuVerts = 0; // vertices transformed on the VFPU (profile wind
 
 static bool32 S3D_TryAddModelLazy(uint16 modelFrames, uint16 sceneIndex, uint8 drawMode, Matrix *matWorld, Matrix *matNormals, color color)
 {
-    if (!matWorld || modelFrames >= MODEL_COUNT || sceneIndex >= SCENE3D_COUNT)
+    // Its faces are left unsorted for the GE's depth test, so without the GE
+    // batch (under an emulator) the stock, sorted path draws them.
+    if (!gu_faceBatchAvailable || !matWorld || modelFrames >= MODEL_COUNT || sceneIndex >= SCENE3D_COUNT)
         return false;
 
     Model *mdl   = &modelList[modelFrames];
@@ -405,7 +407,7 @@ static bool32 S3D_TryAddModelLazy(uint16 modelFrames, uint16 sceneIndex, uint8 d
 static bool32 S3D_TryAddMeshFrameLazy(uint16 modelFrames, uint16 sceneIndex, Animator *animator, uint8 drawMode, Matrix *matWorld,
                                       Matrix *matNormals, color color)
 {
-    if (!matWorld || !animator || modelFrames >= MODEL_COUNT || sceneIndex >= SCENE3D_COUNT)
+    if (!gu_faceBatchAvailable || !matWorld || !animator || modelFrames >= MODEL_COUNT || sceneIndex >= SCENE3D_COUNT)
         return false;
 
     Model *mdl   = &modelList[modelFrames];

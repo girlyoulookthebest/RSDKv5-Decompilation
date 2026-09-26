@@ -281,6 +281,14 @@ static u16 *current_screen_texture = (u16 *)(0x4000000 + 2 * (512 * 272 * 2));
 // bytes, leaving ~1.35MB of VRAM still free.
 static u16 *gu_3d_scratch = (u16 *)(0x4000000 + 2 * (512 * 272 * 2) + (448 * 240 * 2));
 static u16 *screen_pixels = NULL;
+
+// Set in Init when running under an emulator. PPSSPP's GPU renderers keep any
+// buffer the GE draws into on the host GPU, so CPU pixels written into that
+// same VRAM are lost -- and since a289470 the CPU and the GE share
+// screen_pixels. Under an emulator the GE draws nothing there: every layer,
+// sprite and face takes its CPU path, as before the GE paths existed.
+static int32 gu_emulator = 0;
+extern "C" int32 gu_faceBatchAvailable;
 static u32 screen_pitch = 424;
 
 // --- GPU-accelerated sprite draw path (Milestone 1) ---------------------
@@ -1365,6 +1373,8 @@ static void GU_DrawLayerImmediate(TileLayer *layer)
 
 static bool GU_TryQueueLayerGPU(TileLayer *layer)
 {
+    if (gu_emulator)
+        return false;
 #if GU_TILE_PAD_TOGGLE
     if (GU_PadDisablesTiles())
         GU_DECLINE(0);
@@ -1906,7 +1916,7 @@ void GU_QueueBlendedFaceDraw(Vector2 *vertices, uint32 *colors, int32 vertCount,
     // alpha >= 0xFF rejected every face in the game.
     if (!(inkEffect == INK_NONE && (vertCount == 3 || vertCount == 4)))
         ++gu_faceRejectInk;
-    if (inkEffect == INK_NONE && (vertCount == 3 || vertCount == 4)
+    if (gu_faceBatchAvailable && inkEffect == INK_NONE && (vertCount == 3 || vertCount == 4)
 #if GU_TILE_PAD_TOGGLE
         && !GU_PadDisablesFaces()
 #endif
@@ -3205,6 +3215,22 @@ static void GU_XformBench()
 
 bool RenderDevice::Init()
 {//This is just gpSP display code atm...
+  // PPSSPP answers this devctl (3: is emulator); a PSP has no such device and
+  // returns an error. See gu_emulator.
+  {
+      uint32 isEmulator = 0;
+      gu_emulator       = sceIoDevctl("kemulator:", 3, NULL, 0, &isEmulator, sizeof(isEmulator)) >= 0 && isEmulator;
+      if (gu_emulator)
+          gu_faceBatchAvailable = 0; // faces, shadows and the Scene3D fast path go to the CPU
+#if GU_EMU_LOG
+      FILE *ef = fopen("emu_detect.log", "w");
+      if (ef) {
+          fprintf(ef, "emulator %d\n", (int)gu_emulator);
+          fclose(ef);
+      }
+#endif
+  }
+
   // The PSP boots at a conservative default clock unless a game explicitly asks
   // for the max; without this the CPU/bus run well below their real ceiling.
   // 333/333/166 is the hardware maximum and what demanding titles/ports use.
