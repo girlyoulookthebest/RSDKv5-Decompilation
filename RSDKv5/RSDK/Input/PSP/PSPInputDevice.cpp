@@ -141,6 +141,15 @@ void RSDK::SKU::InputDevicePSP::ProcessInput(int32 controllerID)
   if (vOut > -PSP_STICK_DEADZONE && vOut < PSP_STICK_DEADZONE)
       vOut = 0.0f;
 
+  // A direction's magnitude only counts while that direction is engaged.
+  // Player.c crouches on vDelta < -0.3 with no hysteresis of its own, so a
+  // stick resting near 0.3 crouched and stood up over and over; this gives
+  // the magnitudes the same engage/release band as the direction keys.
+  if ((hOut < 0.0f && !stickLeft) || (hOut > 0.0f && !stickRight))
+      hOut = 0.0f;
+  if ((vOut < 0.0f && !stickDown) || (vOut > 0.0f && !stickUp))
+      vOut = 0.0f;
+
   stickL[controllerID].hDelta = hOut;
   stickL[controllerID].vDelta = vOut;
 }
