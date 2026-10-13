@@ -49,14 +49,19 @@ inline void SetActivePalette(uint8 newActiveBank, int32 startLine, int32 endLine
 
 inline uint32 GetPaletteEntry(uint8 bankID, uint8 index)
 {
-    // 0xF800 = 1111 1000 0000 0000 = R
+    // The PSP keeps red in the low bits and blue in the high bits (see the
+    // rgb32To16 tables in Drawing.cpp), so read them back that way. Reading
+    // the desktop layout swapped red and blue on every Get/SetPaletteEntry
+    // round trip, and SetPaletteMask(GetPaletteEntry(...)) never matched the
+    // screen: the Studiopolis yellow-glass windows painted over Sonic's shadow.
+    // 0xF800 = 1111 1000 0000 0000 = B
     // 0x7E0  = 0000 0111 1110 0000 = G
-    // 0x1F   = 0000 0000 0001 1111 = B
+    // 0x1F   = 0000 0000 0001 1111 = R
     uint16 clr = fullPalette[bankID & 7][index];
 
-    int32 R = (clr & 0xF800) << 8;
+    int32 R = (clr & 0x1F) << 19;
     int32 G = (clr & 0x7E0) << 5;
-    int32 B = (clr & 0x1F) << 3;
+    int32 B = (clr & 0xF800) >> 8;
     return R | G | B;
 }
 
