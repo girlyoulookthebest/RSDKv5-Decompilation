@@ -665,7 +665,7 @@ struct GUFaceVertex {
 static u8 *gu_tile_atlas       = NULL;
 static int32 gu_tile_atlas_ok  = 0;
 // One CLUT per palette bank -- see GU_EmitTileTextureState.
-static uint16 __attribute__((aligned(16))) gu_clut_banks[PALETTE_BANK_COUNT][256];
+static u32 __attribute__((aligned(16))) gu_clut_banks[PALETTE_BANK_COUNT][256];
 static uint32 gu_clut_built = 0;
 static int32 gu_atlas_scene    = -1; // listPos the atlas was built for
 static uint8 gu_tile_dirty[TILE_COUNT];  // tiles the engine has rewritten
@@ -2595,18 +2595,23 @@ static void GU_EmitTileTextureState(int32 bank)
 {
     if (bank < 0 || bank >= PALETTE_BANK_COUNT)
         bank = 0;
-    uint16 *clut = gu_clut_banks[bank];
+    u32 *clut = gu_clut_banks[bank];
     if (!(gu_clut_built & (1u << bank))) {
         gu_clut_built |= 1u << bank;
-        // Same 5551 conversion the sprite path uses -- index 0 gets alpha 0,
-        // which is RSDK's transparent.
+        // Index 0 gets alpha 0, which is RSDK's transparent.
         const uint16 *pal = fullPalette[bank];
         for (int32 i = 0; i < 256; ++i) {
             const uint16 c = pal[i];
             const uint16 r5 = c & 0x1F, g6 = (c >> 5) & 0x3F, b5 = (c >> 11) & 0x1F;
-            clut[i] = r5 | ((g6 >> 1) << 5) | (b5 << 10) | (i == 0 ? 0 : (1 << 15));
+            // 8888, widened so the GE writes back exactly the 565 colour the
+            // CPU path would. INK_MASKED/UNMASKED test framebuffer pixels
+            // against maskColor, and a 5551 CLUT dropped green's low bit: the
+            // Studiopolis shop-window silhouette then painted over the whole
+            // window, Sonic included.
+            const u32 r8 = (r5 << 3) | (r5 >> 2), g8 = (g6 << 2) | (g6 >> 4), b8 = (b5 << 3) | (b5 >> 2);
+            clut[i]      = r8 | (g8 << 8) | (b8 << 16) | (i == 0 ? 0 : 0xFF000000u);
         }
-        sceKernelDcacheWritebackRange(clut, 256 * sizeof(uint16));
+        sceKernelDcacheWritebackRange(clut, 256 * sizeof(u32));
     }
 
     // NOT the uncached alias. CBPH is a 4-bit field holding address bits
@@ -2629,8 +2634,8 @@ static void GU_EmitTileTextureState(int32 bank)
     // psm | (shift << 2) | (mask << 8) | (start << 16). The mask is NOT
     // optional: passing 0 ANDs every index to zero, so the whole texture
     // samples CLUT entry 0 and comes out a flat colour.
-    GE_CMD(CMODE, 1 | (0 << 2) | (0xFF << 8) | (0 << 16)); // 5551, mask 0xFF
-    GE_CMD(CLOAD, 256 / 8);     // blocks of 8 entries
+    GE_CMD(CMODE, 3 | (0 << 2) | (0xFF << 8) | (0 << 16)); // 8888, mask 0xFF
+    GE_CMD(CLOAD, 256 / 8);     // 32-byte blocks: 256 entries of 32 bits
 
     // NEAREST, never linear: bilinear on an indexed texture blends palette
     // indices before the lookup, which is meaningless -- that was confirmed
